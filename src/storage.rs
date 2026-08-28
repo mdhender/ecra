@@ -1,0 +1,382 @@
+use std::fs::OpenOptions;
+use std::io;
+use std::path::{Path, PathBuf};
+
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use thiserror::Error;
+
+use crate::accounts::{Account, AccountRole};
+
+const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadata");
+const ACCOUNT_EMAILS: TableDefinition<u32, &str> = TableDefinition::new("account_emails");
+const ACCOUNT_TOKENS: TableDefinition<u32, &str> = TableDefinition::new("account_tokens");
+const ACCOUNT_ROLES: TableDefinition<u32, &str> = TableDefinition::new("account_roles");
+const APPLICATION_KEY: &str = "application";
+const APPLICATION_VALUE: &str = "ecra";
+const FORMAT_VERSION_KEY: &str = "format_version";
+const FORMAT_VERSION_VALUE: &str = "1";
+const SUPPORTED_FORMAT_VERSION: u32 = 1;
+const CURRENT_TURN_KEY: &str = "current_turn";
+const INITIAL_TURN: &str = "1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StoreInfo {
+    pub format_version: u32,
+    pub current_turn: u32,
+}
+
+#[derive(Debug, Error)]
+pub enum StoreError {
+    #[error("store `{}` already exists", .0.display())]
+    AlreadyExists(PathBuf),
+    #[error("could not create store `{}`: {source}", path.display())]
+    Create {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("invalid store path `{}`: {reason}", path.display())]
+    InvalidPath { path: PathBuf, reason: String },
+    #[error("could not access store `{}`: {source}", path.display())]
+    Database {
+        path: PathBuf,
+        #[source]
+        source: redb::Error,
+    },
+    #[error("`{}` is not an ECRA store: {reason}", path.display())]
+    InvalidStore { path: PathBuf, reason: String },
+    #[error("test account {number:04} conflicts with an existing account")]
+    AccountConflict { number: u32 },
+}
+
+pub struct GameStore {
+    database: Database,
+    path: PathBuf,
+}
+
+impl GameStore {
+    /// Creates and initializes a store without replacing an existing file.
+    pub fn create(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_owned();
+        validate_new_store_path(&path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| {
+                if source.kind() == io::ErrorKind::AlreadyExists {
+                    StoreError::AlreadyExists(path.clone())
+                } else {
+                    StoreError::Create {
+                        path: path.clone(),
+                        source,
+                    }
+                }
+            })?;
+
+        let initialized = (|| {
+            let database = Database::builder()
+                .create_file(file)
+                .map_err(|source| database_error(&path, source))?;
+            let write = database
+                .begin_write()
+                .map_err(|source| database_error(&path, source))?;
+            {
+                let mut metadata = write
+                    .open_table(METADATA)
+                    .map_err(|source| database_error(&path, source))?;
+                metadata
+                    .insert(APPLICATION_KEY, APPLICATION_VALUE)
+                    .map_err(|source| database_error(&path, source))?;
+                metadata
+                    .insert(FORMAT_VERSION_KEY, FORMAT_VERSION_VALUE)
+                    .map_err(|source| database_error(&path, source))?;
+                metadata
+                    .insert(CURRENT_TURN_KEY, INITIAL_TURN)
+                    .map_err(|source| database_error(&path, source))?;
+            }
+            write
+                .commit()
+                .map_err(|source| database_error(&path, source))?;
+            Ok(Self {
+                database,
+                path: path.clone(),
+            })
+        })();
+
+        if initialized.is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+        initialized
+    }
+
+    /// Opens an existing ECRA store and validates its metadata.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let path = path.as_ref().to_owned();
+        let database = Database::open(&path).map_err(|source| database_error(&path, source))?;
+        let store = Self { database, path };
+        store.info()?;
+        Ok(store)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn info(&self) -> Result<StoreInfo, StoreError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|source| database_error(&self.path, source))?;
+        let metadata = read
+            .open_table(METADATA)
+            .map_err(|_| StoreError::InvalidStore {
+                path: self.path.clone(),
+                reason: "required metadata is missing".to_owned(),
+            })?;
+
+        let application = metadata_value(&metadata, APPLICATION_KEY, &self.path)?;
+        if application != APPLICATION_VALUE {
+            return Err(StoreError::InvalidStore {
+                path: self.path.clone(),
+                reason: "application identifier is invalid".to_owned(),
+            });
+        }
+
+        let format_version = parse_metadata_u32(&metadata, FORMAT_VERSION_KEY, &self.path)?;
+        if format_version != SUPPORTED_FORMAT_VERSION {
+            return Err(StoreError::InvalidStore {
+                path: self.path.clone(),
+                reason: format!("unsupported format version {format_version}"),
+            });
+        }
+        let current_turn = parse_metadata_u32(&metadata, CURRENT_TURN_KEY, &self.path)?;
+
+        Ok(StoreInfo {
+            format_version,
+            current_turn,
+        })
+    }
+
+    /// Adds the fixed testing accounts, leaving an already-matching seed unchanged.
+    pub fn seed_test_accounts(&self) -> Result<usize, StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        let mut created = 0;
+        {
+            let mut emails = write
+                .open_table(ACCOUNT_EMAILS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut tokens = write
+                .open_table(ACCOUNT_TOKENS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut roles = write
+                .open_table(ACCOUNT_ROLES)
+                .map_err(|source| database_error(&self.path, source))?;
+
+            for number in 1..=13 {
+                let role = if number == 1 {
+                    AccountRole::Administrator
+                } else {
+                    AccountRole::User
+                };
+                let account = Account::test_account(number, role);
+                let stored_email = emails
+                    .get(number)
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value().to_owned());
+                let stored_token = tokens
+                    .get(number)
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value().to_owned());
+                let stored_role = roles
+                    .get(number)
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value().to_owned());
+
+                match (stored_email, stored_token, stored_role) {
+                    (None, None, None) => {
+                        emails
+                            .insert(number, account.email())
+                            .map_err(|source| database_error(&self.path, source))?;
+                        tokens
+                            .insert(number, account.token())
+                            .map_err(|source| database_error(&self.path, source))?;
+                        roles
+                            .insert(number, account.role().as_str())
+                            .map_err(|source| database_error(&self.path, source))?;
+                        created += 1;
+                    }
+                    (Some(email), Some(token), Some(stored_role))
+                        if email == account.email()
+                            && token == account.token()
+                            && stored_role == account.role().as_str() => {}
+                    _ => return Err(StoreError::AccountConflict { number }),
+                }
+            }
+        }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(created)
+    }
+}
+
+fn validate_new_store_path(path: &Path) -> Result<(), StoreError> {
+    if path.file_name().is_none() {
+        return Err(StoreError::InvalidPath {
+            path: path.to_owned(),
+            reason: "path must include a store filename".to_owned(),
+        });
+    }
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = std::fs::metadata(parent).map_err(|source| {
+        if source.kind() == io::ErrorKind::NotFound {
+            StoreError::InvalidPath {
+                path: path.to_owned(),
+                reason: format!("parent directory `{}` does not exist", parent.display()),
+            }
+        } else {
+            StoreError::Create {
+                path: path.to_owned(),
+                source,
+            }
+        }
+    })?;
+    if !metadata.is_dir() {
+        return Err(StoreError::InvalidPath {
+            path: path.to_owned(),
+            reason: format!("parent path `{}` is not a directory", parent.display()),
+        });
+    }
+    Ok(())
+}
+
+fn metadata_value(
+    table: &impl ReadableTable<&'static str, &'static str>,
+    key: &str,
+    path: &Path,
+) -> Result<String, StoreError> {
+    table
+        .get(key)
+        .map_err(|source| database_error(path, source))?
+        .map(|value| value.value().to_owned())
+        .ok_or_else(|| StoreError::InvalidStore {
+            path: path.to_owned(),
+            reason: format!("metadata field `{key}` is missing"),
+        })
+}
+
+fn parse_metadata_u32(
+    table: &impl ReadableTable<&'static str, &'static str>,
+    key: &str,
+    path: &Path,
+) -> Result<u32, StoreError> {
+    metadata_value(table, key, path)?
+        .parse()
+        .map_err(|_| StoreError::InvalidStore {
+            path: path.to_owned(),
+            reason: format!("metadata field `{key}` is invalid"),
+        })
+}
+
+fn database_error(path: &Path, source: impl Into<redb::Error>) -> StoreError {
+    StoreError::Database {
+        path: path.to_owned(),
+        source: source.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use redb::ReadableTableMetadata;
+
+    #[test]
+    fn creates_and_reopens_a_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+
+        let store = GameStore::create(&path).unwrap();
+        assert_eq!(
+            store.info().unwrap(),
+            StoreInfo {
+                format_version: 1,
+                current_turn: 1
+            }
+        );
+        drop(store);
+
+        let reopened = GameStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.info().unwrap(),
+            StoreInfo {
+                format_version: 1,
+                current_turn: 1
+            }
+        );
+    }
+
+    #[test]
+    fn does_not_replace_an_existing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        std::fs::write(&path, "keep me").unwrap();
+
+        assert!(
+            matches!(GameStore::create(&path), Err(StoreError::AlreadyExists(found)) if found == path)
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "keep me");
+    }
+
+    #[test]
+    fn does_not_create_a_missing_parent_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing_parent = directory.path().join("missing");
+        let path = missing_parent.join("game.redb");
+
+        assert!(matches!(
+            GameStore::create(&path),
+            Err(StoreError::InvalidPath { .. })
+        ));
+        assert!(!missing_parent.exists());
+    }
+
+    #[test]
+    fn seeds_test_accounts_idempotently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        let store = GameStore::create(&path).unwrap();
+
+        assert_eq!(store.seed_test_accounts().unwrap(), 13);
+        assert_eq!(store.seed_test_accounts().unwrap(), 0);
+
+        let read = store.database.begin_read().unwrap();
+        let emails = read.open_table(ACCOUNT_EMAILS).unwrap();
+        let tokens = read.open_table(ACCOUNT_TOKENS).unwrap();
+        let roles = read.open_table(ACCOUNT_ROLES).unwrap();
+        assert_eq!(emails.len().unwrap(), 13);
+        assert_eq!(tokens.len().unwrap(), 13);
+        assert_eq!(roles.len().unwrap(), 13);
+
+        for number in 1..=13 {
+            assert_eq!(
+                emails.get(number).unwrap().unwrap().value(),
+                format!("account.{number:04}@example.com")
+            );
+            assert_eq!(
+                tokens.get(number).unwrap().unwrap().value(),
+                format!("amp.rocks.{number:04}")
+            );
+            let expected_role = if number == 1 { "administrator" } else { "user" };
+            assert_eq!(roles.get(number).unwrap().unwrap().value(), expected_role);
+        }
+    }
+}
