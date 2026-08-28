@@ -81,6 +81,41 @@ pub struct OrderFilePreamble {
     pub token: AuthenticationToken,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InventoryStatus {
+    Available,
+    Reserved,
+    Damaged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Order {
+    Move {
+        entity: u64,
+        destination: u64,
+    },
+    Transfer {
+        source_entity: u64,
+        unit: String,
+        status: InventoryStatus,
+        quantity: u64,
+        destination_entity: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocatedOrder {
+    pub line: usize,
+    pub order: Order,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParsedOrderFile {
+    pub header: OrderFileHeader,
+    pub owner: OrderFileOwner,
+    pub orders: Vec<LocatedOrder>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     filename: String,
@@ -146,7 +181,7 @@ pub fn parse_order_file_header(
     source: &str,
 ) -> Result<OrderFileHeader, ParseError> {
     let filename = filename.into();
-    let tokens = tokenize(&filename, source)?;
+    let (tokens, mut lexical_errors) = tokenize_all(&filename, source);
     let eof_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let mut parser = Parser {
         filename: &filename,
@@ -155,7 +190,14 @@ pub fn parse_order_file_header(
         eof_line,
     };
 
-    parser.parse_header()
+    match parser.parse_header() {
+        Ok(header) => Ok(header),
+        Err(error) => {
+            lexical_errors.push(error);
+            lexical_errors.sort_by_key(|error| error.line);
+            Err(lexical_errors.remove(0))
+        }
+    }
 }
 
 /// Parses the required game/turn and authentication entries at the start of
@@ -165,7 +207,7 @@ pub fn parse_order_file_preamble(
     source: &str,
 ) -> Result<OrderFilePreamble, ParseError> {
     let filename = filename.into();
-    let tokens = tokenize(&filename, source)?;
+    let (tokens, mut lexical_errors) = tokenize_all(&filename, source);
     let eof_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
     let mut parser = Parser {
         filename: &filename,
@@ -174,13 +216,107 @@ pub fn parse_order_file_preamble(
         eof_line,
     };
 
-    let header = parser.parse_header()?;
-    let (owner, token) = parser.parse_authentication()?;
+    let parsed = parser.parse_header().and_then(|header| {
+        parser
+            .parse_authentication()
+            .map(|authentication| (header, authentication))
+    });
+    let (header, authentication) = match parsed {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            lexical_errors.push(error);
+            lexical_errors.sort_by_key(|error| error.line);
+            return Err(lexical_errors.remove(0));
+        }
+    };
     Ok(OrderFilePreamble {
         header,
-        owner,
-        token,
+        owner: authentication.owner,
+        token: authentication.token,
     })
+}
+
+/// Parses every player order, returning all independent syntax errors together.
+pub fn parse_order_file(
+    filename: impl Into<String>,
+    source: &str,
+) -> Result<ParsedOrderFile, Vec<ParseError>> {
+    let filename = filename.into();
+    let eof_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let (tokens, mut errors) = tokenize_all(&filename, source);
+    let mut segments = Vec::new();
+    let mut start = 0;
+
+    for end in (0..tokens.len()).filter(|index| tokens[*index].kind == TokenKind::Semicolon) {
+        segments.push(&tokens[start..=end]);
+        start = end + 1;
+    }
+    if start < tokens.len() {
+        segments.push(&tokens[start..]);
+    }
+
+    let mut header = None;
+    let mut owner = None;
+    let mut orders = Vec::new();
+
+    if let Some(tokens) = segments.first() {
+        let mut parser = Parser::new(&filename, tokens, eof_line);
+        match parser.parse_header().and_then(|value| {
+            parser.expect_end()?;
+            Ok(value)
+        }) {
+            Ok(value) => header = Some(value),
+            Err(error) => errors.push(error),
+        }
+    } else {
+        errors.push(ParseError {
+            filename: filename.clone(),
+            line: eof_line,
+            offending_text: None,
+            explanation: "expected `game` as the first order".to_owned(),
+        });
+    }
+
+    if let Some(tokens) = segments.get(1) {
+        let mut parser = Parser::new(&filename, tokens, eof_line);
+        match parser.parse_authentication().and_then(|value| {
+            parser.expect_end()?;
+            Ok(value)
+        }) {
+            Ok(value) => owner = Some(value.owner),
+            Err(error) => errors.push(error),
+        }
+    } else {
+        errors.push(ParseError {
+            filename: filename.clone(),
+            line: eof_line,
+            offending_text: None,
+            explanation: "expected `authenticate` as the second order".to_owned(),
+        });
+    }
+
+    for tokens in segments.iter().skip(2) {
+        let line = tokens.first().map_or(eof_line, |token| token.line);
+        let mut parser = Parser::new(&filename, tokens, eof_line);
+        match parser.parse_player_order().and_then(|order| {
+            parser.expect_end()?;
+            Ok(order)
+        }) {
+            Ok(order) => orders.push(LocatedOrder { line, order }),
+            Err(error) => errors.push(error),
+        }
+    }
+
+    errors.sort_by_key(|error| error.line);
+    if errors.is_empty() {
+        Ok(ParsedOrderFile {
+            header: header.expect("a successful parse has a header"),
+            owner: owner.expect("a successful parse has an owner"),
+            orders,
+        })
+    } else {
+        Err(errors)
+    }
 }
 
 /// Checks every order in a file and returns all syntax errors found.
@@ -190,85 +326,7 @@ pub fn parse_order_file_preamble(
 /// the file. The first two orders must be the game header and authentication
 /// order, respectively.
 pub fn check_order_file_syntax(filename: impl Into<String>, source: &str) -> Vec<ParseError> {
-    let filename = filename.into();
-    let eof_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
-    let (tokens, mut errors) = tokenize_all(&filename, source);
-    let mut start = 0;
-    let mut order_index = 0;
-
-    for end in (0..tokens.len()).filter(|index| tokens[*index].kind == TokenKind::Semicolon) {
-        check_order(
-            &filename,
-            &tokens[start..=end],
-            eof_line,
-            order_index,
-            &mut errors,
-        );
-        order_index += 1;
-        start = end + 1;
-    }
-
-    if start < tokens.len() {
-        check_order(
-            &filename,
-            &tokens[start..],
-            eof_line,
-            order_index,
-            &mut errors,
-        );
-        order_index += 1;
-    }
-
-    if order_index == 0 {
-        errors.push(ParseError {
-            filename: filename.clone(),
-            line: eof_line,
-            offending_text: None,
-            explanation: "expected `game` as the first order".to_owned(),
-        });
-    }
-    if order_index < 2 {
-        errors.push(ParseError {
-            filename,
-            line: eof_line,
-            offending_text: None,
-            explanation: "expected `authenticate` as the second order".to_owned(),
-        });
-    }
-
-    errors.sort_by_key(|error| error.line);
-    errors
-}
-
-fn check_order(
-    filename: &str,
-    tokens: &[Token<'_>],
-    eof_line: usize,
-    order_index: usize,
-    errors: &mut Vec<ParseError>,
-) {
-    let mut parser = Parser {
-        filename,
-        tokens,
-        position: 0,
-        eof_line,
-    };
-    let result = match order_index {
-        0 => parser.parse_header().map(|_| ()),
-        1 => parser.parse_authentication().map(|_| ()),
-        _ => parser.parse_player_order(),
-    };
-    if let Err(error) = result.and_then(|()| parser.expect_end()) {
-        errors.push(error);
-    }
-}
-
-fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, ParseError> {
-    let (tokens, errors) = tokenize_all(filename, source);
-    if let Some(error) = errors.into_iter().next() {
-        return Err(error);
-    }
-    Ok(tokens)
+    parse_order_file(filename, source).err().unwrap_or_default()
 }
 
 fn tokenize_all<'a>(filename: &str, source: &'a str) -> (Vec<Token<'a>>, Vec<ParseError>) {
@@ -413,7 +471,21 @@ struct Parser<'a, 'source> {
     eof_line: usize,
 }
 
-impl<'source> Parser<'_, 'source> {
+struct ParsedAuthentication {
+    owner: OrderFileOwner,
+    token: AuthenticationToken,
+}
+
+impl<'a, 'source> Parser<'a, 'source> {
+    fn new(filename: &'a str, tokens: &'a [Token<'source>], eof_line: usize) -> Self {
+        Parser {
+            filename,
+            tokens,
+            position: 0,
+            eof_line,
+        }
+    }
+
     fn parse_header(&mut self) -> Result<OrderFileHeader, ParseError> {
         self.expect_word("game")?;
         let game = GameCode(self.take_word("game code")?.to_owned());
@@ -433,9 +505,7 @@ impl<'source> Parser<'_, 'source> {
         })
     }
 
-    fn parse_authentication(
-        &mut self,
-    ) -> Result<(OrderFileOwner, AuthenticationToken), ParseError> {
+    fn parse_authentication(&mut self) -> Result<ParsedAuthentication, ParseError> {
         self.expect_word("authenticate")?;
         let owner_kind = self.take_word("`email`, `player`, or `faction`")?;
         let owner = match owner_kind {
@@ -457,31 +527,51 @@ impl<'source> Parser<'_, 'source> {
         };
         self.expect_word("with")?;
         self.expect_word("token")?;
-        let token = AuthenticationToken(self.take_quoted("authentication token")?.to_owned());
+        let token_value = self.take_quoted_token("authentication token")?;
+        let token = AuthenticationToken(match token_value.kind {
+            TokenKind::Quoted(text) => text.to_owned(),
+            _ => unreachable!("take_quoted_token returned a quoted token"),
+        });
         self.expect_semicolon()?;
 
-        Ok((owner, token))
+        Ok(ParsedAuthentication { owner, token })
     }
 
-    fn parse_player_order(&mut self) -> Result<(), ParseError> {
+    fn parse_player_order(&mut self) -> Result<Order, ParseError> {
         let command = self.take_word("order name")?;
-        match command {
+        let order = match command {
             "MOVE" => {
-                self.take_u64("entity ID")?;
-                self.take_u64("destination ID")?;
+                let entity = self.take_u64("entity ID")?;
+                let destination = self.take_u64("destination ID")?;
+                Order::Move {
+                    entity,
+                    destination,
+                }
             }
             "TRANSFER" => {
-                self.take_u64("source entity ID")?;
-                self.take_word("unit")?;
-                let status = self.take_word("inventory status")?;
-                if !matches!(status, "AVAILABLE" | "RESERVED" | "DAMAGED") {
-                    return Err(self.error_at_current_or_previous(
-                        Some(status),
-                        "expected inventory status `AVAILABLE`, `RESERVED`, or `DAMAGED`",
-                    ));
+                let source_entity = self.take_u64("source entity ID")?;
+                let unit = self.take_word("unit")?.to_owned();
+                let status_text = self.take_word("inventory status")?;
+                let status = match status_text {
+                    "AVAILABLE" => InventoryStatus::Available,
+                    "RESERVED" => InventoryStatus::Reserved,
+                    "DAMAGED" => InventoryStatus::Damaged,
+                    other => {
+                        return Err(self.error_at_current_or_previous(
+                            Some(other),
+                            "expected inventory status `AVAILABLE`, `RESERVED`, or `DAMAGED`",
+                        ));
+                    }
+                };
+                let quantity = self.take_u64("quantity")?;
+                let destination_entity = self.take_u64("destination entity ID")?;
+                Order::Transfer {
+                    source_entity,
+                    unit,
+                    status,
+                    quantity,
+                    destination_entity,
                 }
-                self.take_u64("quantity")?;
-                self.take_u64("destination entity ID")?;
             }
             other => {
                 return Err(self.error_at_current_or_previous(
@@ -489,8 +579,9 @@ impl<'source> Parser<'_, 'source> {
                     "expected order `MOVE` or `TRANSFER`",
                 ));
             }
-        }
-        self.expect_semicolon()
+        };
+        self.expect_semicolon()?;
+        Ok(order)
     }
 
     fn take_u64(&mut self, description: &str) -> Result<u64, ParseError> {
@@ -544,7 +635,7 @@ impl<'source> Parser<'_, 'source> {
         }
     }
 
-    fn take_quoted(&mut self, description: &str) -> Result<&'source str, ParseError> {
+    fn take_quoted_token(&mut self, description: &str) -> Result<Token<'source>, ParseError> {
         let token = self.next_token().ok_or_else(|| {
             self.error(
                 self.eof_line,
@@ -553,7 +644,7 @@ impl<'source> Parser<'_, 'source> {
             )
         })?;
         match token.kind {
-            TokenKind::Quoted(text) => Ok(text),
+            TokenKind::Quoted(_) => Ok(token),
             TokenKind::Word(_) => {
                 Err(self.error(token.line, None, format!("expected quoted {description}")))
             }
@@ -858,5 +949,54 @@ mod tests {
         );
 
         assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parses_a_valid_preamble_despite_a_malformed_body() {
+        let source = concat!(
+            "game ECRA turn 3;\n",
+            "authenticate email account.0001@example.com with token \"secret\";\n",
+            "TRANSFER 1001 \"unterminated\n",
+        );
+
+        assert!(parse_order_file_preamble("orders.txt", source).is_ok());
+        assert!(parse_order_file("orders.txt", source).is_err());
+    }
+
+    #[test]
+    fn parses_player_orders_into_domain_values_with_source_lines() {
+        let parsed = parse_order_file(
+            "orders.txt",
+            concat!(
+                "game ECRA turn 3;\n",
+                "authenticate email account.0001@example.com with token \"secret\";\n",
+                "MOVE 1001 12;\n",
+                "TRANSFER 1001 FOOD RESERVED 25 1002;\n",
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.orders,
+            vec![
+                LocatedOrder {
+                    line: 3,
+                    order: Order::Move {
+                        entity: 1001,
+                        destination: 12,
+                    },
+                },
+                LocatedOrder {
+                    line: 4,
+                    order: Order::Transfer {
+                        source_entity: 1001,
+                        unit: "FOOD".to_owned(),
+                        status: InventoryStatus::Reserved,
+                        quantity: 25,
+                        destination_entity: 1002,
+                    },
+                },
+            ]
+        );
     }
 }

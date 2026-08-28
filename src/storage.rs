@@ -11,6 +11,14 @@ const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadat
 const ACCOUNT_EMAILS: TableDefinition<u32, &str> = TableDefinition::new("account_emails");
 const ACCOUNT_TOKENS: TableDefinition<u32, &str> = TableDefinition::new("account_tokens");
 const ACCOUNT_ROLES: TableDefinition<u32, &str> = TableDefinition::new("account_roles");
+const ORDER_IMPORT_FILENAMES: TableDefinition<u64, &str> =
+    TableDefinition::new("order_import_filenames");
+const ORDER_IMPORT_SOURCES: TableDefinition<u64, &str> =
+    TableDefinition::new("order_import_sources");
+const ORDER_IMPORT_PARSE_STATUS: TableDefinition<u64, &str> =
+    TableDefinition::new("order_import_parse_status");
+const ORDER_IMPORT_DIAGNOSTICS: TableDefinition<u64, &str> =
+    TableDefinition::new("order_import_diagnostics");
 const APPLICATION_KEY: &str = "application";
 const APPLICATION_VALUE: &str = "ecra";
 const FORMAT_VERSION_KEY: &str = "format_version";
@@ -18,6 +26,30 @@ const FORMAT_VERSION_VALUE: &str = "1";
 const SUPPORTED_FORMAT_VERSION: u32 = 1;
 const CURRENT_TURN_KEY: &str = "current_turn";
 const INITIAL_TURN: &str = "1";
+const NEXT_ORDER_IMPORT_KEY: &str = "next_order_import";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct OrderImportId(u64);
+
+impl OrderImportId {
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StoredParseOutcome {
+    Success,
+    Failure(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImportedOrderFile {
+    pub id: OrderImportId,
+    pub filename: String,
+    pub source: String,
+    pub parse_outcome: Option<StoredParseOutcome>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StoreInfo {
@@ -47,6 +79,10 @@ pub enum StoreError {
     InvalidStore { path: PathBuf, reason: String },
     #[error("test account {number:04} conflicts with an existing account")]
     AccountConflict { number: u32 },
+    #[error("order import {0} does not exist")]
+    OrderImportNotFound(u64),
+    #[error("order import {0} already has a different parse result")]
+    ParseResultConflict(u64),
 }
 
 pub struct GameStore {
@@ -94,6 +130,9 @@ impl GameStore {
                     .map_err(|source| database_error(&path, source))?;
                 metadata
                     .insert(CURRENT_TURN_KEY, INITIAL_TURN)
+                    .map_err(|source| database_error(&path, source))?;
+                metadata
+                    .insert(NEXT_ORDER_IMPORT_KEY, "1")
                     .map_err(|source| database_error(&path, source))?;
             }
             write
@@ -222,6 +261,193 @@ impl GameStore {
             .commit()
             .map_err(|source| database_error(&self.path, source))?;
         Ok(created)
+    }
+
+    /// Atomically stores a raw order-file submission without interpreting it.
+    pub(crate) fn import_order_file(
+        &self,
+        filename: &str,
+        source: &str,
+    ) -> Result<OrderImportId, StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+
+        let id = {
+            let mut metadata = write
+                .open_table(METADATA)
+                .map_err(|source| database_error(&self.path, source))?;
+            let next = metadata
+                .get(NEXT_ORDER_IMPORT_KEY)
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value().parse::<u64>())
+                .transpose()
+                .map_err(|_| StoreError::InvalidStore {
+                    path: self.path.clone(),
+                    reason: format!("metadata field `{NEXT_ORDER_IMPORT_KEY}` is invalid"),
+                })?
+                .unwrap_or(1);
+            let following = next
+                .checked_add(1)
+                .ok_or_else(|| StoreError::InvalidStore {
+                    path: self.path.clone(),
+                    reason: "order import IDs are exhausted".to_owned(),
+                })?;
+            let following = following.to_string();
+            metadata
+                .insert(NEXT_ORDER_IMPORT_KEY, following.as_str())
+                .map_err(|source| database_error(&self.path, source))?;
+            OrderImportId(next)
+        };
+
+        write
+            .open_table(ORDER_IMPORT_FILENAMES)
+            .map_err(|source| database_error(&self.path, source))?
+            .insert(id.0, filename)
+            .map_err(|source| database_error(&self.path, source))?;
+        write
+            .open_table(ORDER_IMPORT_SOURCES)
+            .map_err(|source| database_error(&self.path, source))?
+            .insert(id.0, source)
+            .map_err(|source| database_error(&self.path, source))?;
+        write
+            .open_table(ORDER_IMPORT_PARSE_STATUS)
+            .map_err(|source| database_error(&self.path, source))?;
+        write
+            .open_table(ORDER_IMPORT_DIAGNOSTICS)
+            .map_err(|source| database_error(&self.path, source))?;
+
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(id)
+    }
+
+    pub(crate) fn record_order_parse_result(
+        &self,
+        id: OrderImportId,
+        outcome: &StoredParseOutcome,
+    ) -> Result<(), StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        let status = match outcome {
+            StoredParseOutcome::Success => "success",
+            StoredParseOutcome::Failure(_) => "failure",
+        };
+        let diagnostics = match outcome {
+            StoredParseOutcome::Success => "",
+            StoredParseOutcome::Failure(diagnostics) => diagnostics,
+        };
+
+        {
+            let sources = write
+                .open_table(ORDER_IMPORT_SOURCES)
+                .map_err(|source| database_error(&self.path, source))?;
+            if sources
+                .get(id.0)
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::OrderImportNotFound(id.0));
+            }
+        }
+        {
+            let mut statuses = write
+                .open_table(ORDER_IMPORT_PARSE_STATUS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut stored_diagnostics = write
+                .open_table(ORDER_IMPORT_DIAGNOSTICS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let existing_status = statuses
+                .get(id.0)
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value().to_owned());
+            let existing_diagnostics = stored_diagnostics
+                .get(id.0)
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value().to_owned());
+            if let Some(existing_status) = existing_status {
+                if existing_status != status || existing_diagnostics.as_deref() != Some(diagnostics)
+                {
+                    return Err(StoreError::ParseResultConflict(id.0));
+                }
+            } else {
+                statuses
+                    .insert(id.0, status)
+                    .map_err(|source| database_error(&self.path, source))?;
+                stored_diagnostics
+                    .insert(id.0, diagnostics)
+                    .map_err(|source| database_error(&self.path, source))?;
+            }
+        }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))
+    }
+
+    pub fn load_order_import(&self, id: OrderImportId) -> Result<ImportedOrderFile, StoreError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|source| database_error(&self.path, source))?;
+        let filenames = read
+            .open_table(ORDER_IMPORT_FILENAMES)
+            .map_err(|source| database_error(&self.path, source))?;
+        let sources = read
+            .open_table(ORDER_IMPORT_SOURCES)
+            .map_err(|source| database_error(&self.path, source))?;
+        let statuses = read
+            .open_table(ORDER_IMPORT_PARSE_STATUS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let diagnostics = read
+            .open_table(ORDER_IMPORT_DIAGNOSTICS)
+            .map_err(|source| database_error(&self.path, source))?;
+
+        let required = |value: Option<String>| value.ok_or(StoreError::OrderImportNotFound(id.0));
+        let filename = required(
+            filenames
+                .get(id.0)
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value().to_owned()),
+        )?;
+        let source = required(
+            sources
+                .get(id.0)
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value().to_owned()),
+        )?;
+        let parse_outcome = match statuses
+            .get(id.0)
+            .map_err(|source| database_error(&self.path, source))?
+            .map(|value| value.value().to_owned())
+            .as_deref()
+        {
+            None => None,
+            Some("success") => Some(StoredParseOutcome::Success),
+            Some("failure") => Some(StoredParseOutcome::Failure(
+                diagnostics
+                    .get(id.0)
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value().to_owned())
+                    .unwrap_or_default(),
+            )),
+            Some(other) => {
+                return Err(StoreError::InvalidStore {
+                    path: self.path.clone(),
+                    reason: format!("order import {0} has invalid parse status `{other}`", id.0),
+                });
+            }
+        };
+
+        Ok(ImportedOrderFile {
+            id,
+            filename,
+            source,
+            parse_outcome,
+        })
     }
 }
 

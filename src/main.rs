@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use ecra::app::import_order_file;
 use ecra::orders::check_order_file_syntax;
 use ecra::storage::GameStore;
 
@@ -35,6 +36,13 @@ enum Command {
     /// Check an order file for syntax errors
     CheckOrders {
         /// Path of the order file to check
+        file: PathBuf,
+    },
+    /// Import and parse a raw order file
+    ImportOrders {
+        /// Path of the game store
+        store: PathBuf,
+        /// Path of the order file to import
         file: PathBuf,
     },
 }
@@ -85,6 +93,33 @@ fn run() -> Result<(), Box<dyn Error>> {
                     if errors.len() == 1 { "" } else { "s" }
                 )
                 .into());
+            }
+        }
+        Command::ImportOrders { store, file } => {
+            let store = GameStore::open(store)?;
+            let source = fs::read_to_string(&file)?;
+            let result = import_order_file(&store, &file.display().to_string(), &source)?;
+            println!(
+                "Imported {} as order import {}",
+                file.display(),
+                result.imported.id.number()
+            );
+            match result.parsed {
+                Ok(parsed) => {
+                    println!("Parsed {} player orders successfully", parsed.orders.len());
+                }
+                Err(errors) => {
+                    for error in &errors {
+                        eprintln!("{error}");
+                    }
+                    return Err(format!(
+                        "imported file {} contains {} syntax error{}; no orders are ready for validation",
+                        result.imported.id.number(),
+                        errors.len(),
+                        if errors.len() == 1 { "" } else { "s" }
+                    )
+                    .into());
+                }
             }
         }
     }

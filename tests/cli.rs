@@ -14,6 +14,7 @@ fn help_lists_store_commands() {
     assert!(stdout.contains("new"));
     assert!(stdout.contains("manage"));
     assert!(stdout.contains("check-orders"));
+    assert!(stdout.contains("import-orders"));
     assert!(stdout.contains("help"));
 }
 
@@ -203,4 +204,132 @@ fn check_orders_reports_all_errors_and_fails() {
     assert!(stderr.contains("multiple-syntax-errors.orders:2:"));
     assert!(stderr.contains("multiple-syntax-errors.orders:3:"));
     assert!(stderr.contains("found 3 syntax errors"));
+}
+
+#[test]
+fn import_orders_persists_and_parses_the_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let orders = directory.path().join("player.orders");
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        &orders,
+        concat!(
+            "game ECRA turn 1;\n",
+            "authenticate email account.0002@example.com with token \"amp.rocks.0002\";\n",
+            "MOVE 1001 12;\n",
+        ),
+    )
+    .unwrap();
+
+    let output = ecra()
+        .args([
+            "import-orders",
+            store.to_str().unwrap(),
+            orders.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("order import 1"));
+    assert!(stdout.contains("Parsed 1 player orders successfully"));
+}
+
+#[test]
+fn import_orders_does_not_authenticate_the_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let orders = directory.path().join("rejected.orders");
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        &orders,
+        concat!(
+            "game ECRA turn 1;\n",
+            "authenticate email nobody@example.com with token \"not checked\";\n",
+            "MOVE 1001 12;\n",
+        ),
+    )
+    .unwrap();
+
+    let output = ecra()
+        .args([
+            "import-orders",
+            store.to_str().unwrap(),
+            orders.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("order import 1")
+    );
+}
+
+#[test]
+fn import_orders_reports_body_syntax_errors_after_import() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let orders = directory.path().join("bad.orders");
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::write(
+        &orders,
+        concat!(
+            "game ECRA turn 1;\n",
+            "authenticate email account.0002@example.com with token \"amp.rocks.0002\";\n",
+            "MOVE unknown 12;\n",
+            "TRANSFER 1 FOOD LOST 2 3;\n",
+        ),
+    )
+    .unwrap();
+
+    let output = ecra()
+        .args([
+            "import-orders",
+            store.to_str().unwrap(),
+            orders.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("order import 1")
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("bad.orders:3:"));
+    assert!(stderr.contains("bad.orders:4:"));
+    assert!(stderr.contains("contains 2 syntax errors"));
 }
