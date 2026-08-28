@@ -1,2 +1,2 @@
-game ECRA-01 turn 7.
-authenticate player not-a-number with token secret.
+game ECRA-01 turn 7;
+authenticate player not-a-number with token secret;

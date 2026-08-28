@@ -362,8 +362,8 @@ For now, define an intentionally small order language.
 Example input:
 
 ```text
-MOVE 1001 12
-TRANSFER 1001 FOOD AVAILABLE 25 1002
+MOVE 1001 12;
+TRANSFER 1001 FOOD AVAILABLE 25 1002;
 ```
 
 where these might mean:
@@ -415,7 +415,7 @@ Distinguish parsing from validation.
 For example:
 
 ```text
-MOVE 999999 12
+MOVE 999999 12;
 ```
 
 may be syntactically valid but invalid because Entity `999999` does not exist.

@@ -1,2 +1,2 @@
-game ECRA-01 turn 7.
-authenticate email admiral.sato@example.com with token "opaque token.value" .
+game ECRA-01 turn 7;
+authenticate email admiral.sato@example.com with token "opaque token.value" ;

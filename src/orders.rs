@@ -127,7 +127,7 @@ impl Error for ParseError {}
 enum TokenKind<'a> {
     Word(&'a str),
     Quoted(&'a str),
-    Period,
+    Semicolon,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -138,8 +138,8 @@ struct Token<'a> {
 
 /// Parses the required first entry of an order file.
 ///
-/// The accepted syntax is `game GAME-CODE turn TURN-NUMBER .`. Whitespace,
-/// including newlines, separates tokens. The terminating period may be
+/// The accepted syntax is `game GAME-CODE turn TURN-NUMBER ;`. Whitespace,
+/// including newlines, separates tokens. The terminating semicolon may be
 /// attached to the turn number.
 pub fn parse_order_file_header(
     filename: impl Into<String>,
@@ -185,7 +185,7 @@ pub fn parse_order_file_preamble(
 
 /// Checks every order in a file and returns all syntax errors found.
 ///
-/// Orders are terminated by periods. After an error, checking resumes at the
+/// Orders are terminated by semicolons. After an error, checking resumes at the
 /// next order so that one invocation can report independent errors throughout
 /// the file. The first two orders must be the game header and authentication
 /// order, respectively.
@@ -196,7 +196,7 @@ pub fn check_order_file_syntax(filename: impl Into<String>, source: &str) -> Vec
     let mut start = 0;
     let mut order_index = 0;
 
-    for end in (0..tokens.len()).filter(|index| tokens[*index].kind == TokenKind::Period) {
+    for end in (0..tokens.len()).filter(|index| tokens[*index].kind == TokenKind::Semicolon) {
         check_order(
             &filename,
             &tokens[start..=end],
@@ -351,9 +351,9 @@ fn tokenize_all<'a>(filename: &str, source: &'a str) -> (Vec<Token<'a>>, Vec<Par
                     .chars()
                     .next()
                     .expect("index is before the end of source");
-                if next == '.' {
+                if next == ';' {
                     tokens.push(Token {
-                        kind: TokenKind::Period,
+                        kind: TokenKind::Semicolon,
                         line,
                     });
                     index += next.len_utf8();
@@ -362,7 +362,7 @@ fn tokenize_all<'a>(filename: &str, source: &'a str) -> (Vec<Token<'a>>, Vec<Par
                         filename: filename.to_owned(),
                         line,
                         offending_text: Some(next.to_string()),
-                        explanation: "expected whitespace or `.` after quoted text".to_owned(),
+                        explanation: "expected whitespace or `;` after quoted text".to_owned(),
                     });
                 }
             }
@@ -387,7 +387,7 @@ fn tokenize_all<'a>(filename: &str, source: &'a str) -> (Vec<Token<'a>>, Vec<Par
 }
 
 fn push_word_or_terminated_word<'a>(tokens: &mut Vec<Token<'a>>, word: &'a str, line: usize) {
-    if let Some(word) = word.strip_suffix('.') {
+    if let Some(word) = word.strip_suffix(';') {
         if !word.is_empty() {
             tokens.push(Token {
                 kind: TokenKind::Word(word),
@@ -395,7 +395,7 @@ fn push_word_or_terminated_word<'a>(tokens: &mut Vec<Token<'a>>, word: &'a str, 
             });
         }
         tokens.push(Token {
-            kind: TokenKind::Period,
+            kind: TokenKind::Semicolon,
             line,
         });
     } else {
@@ -425,7 +425,7 @@ impl<'source> Parser<'_, 'source> {
                 "turn number must be an unsigned 32-bit integer",
             )
         })?;
-        self.expect_period()?;
+        self.expect_semicolon()?;
 
         Ok(OrderFileHeader {
             game,
@@ -458,7 +458,7 @@ impl<'source> Parser<'_, 'source> {
         self.expect_word("with")?;
         self.expect_word("token")?;
         let token = AuthenticationToken(self.take_quoted("authentication token")?.to_owned());
-        self.expect_period()?;
+        self.expect_semicolon()?;
 
         Ok((owner, token))
     }
@@ -490,7 +490,7 @@ impl<'source> Parser<'_, 'source> {
                 ));
             }
         }
-        self.expect_period()
+        self.expect_semicolon()
     }
 
     fn take_u64(&mut self, description: &str) -> Result<u64, ParseError> {
@@ -521,8 +521,8 @@ impl<'source> Parser<'_, 'source> {
                 Some("<quoted text>"),
                 format!("expected `{expected}`"),
             )),
-            TokenKind::Period => {
-                Err(self.error(token.line, Some("."), format!("expected `{expected}`")))
+            TokenKind::Semicolon => {
+                Err(self.error(token.line, Some(";"), format!("expected `{expected}`")))
             }
         }
     }
@@ -538,8 +538,8 @@ impl<'source> Parser<'_, 'source> {
                 Some("<quoted text>"),
                 format!("expected {description}"),
             )),
-            TokenKind::Period => {
-                Err(self.error(token.line, Some("."), format!("expected {description}")))
+            TokenKind::Semicolon => {
+                Err(self.error(token.line, Some(";"), format!("expected {description}")))
             }
         }
     }
@@ -557,23 +557,23 @@ impl<'source> Parser<'_, 'source> {
             TokenKind::Word(_) => {
                 Err(self.error(token.line, None, format!("expected quoted {description}")))
             }
-            TokenKind::Period => Err(self.error(
+            TokenKind::Semicolon => Err(self.error(
                 token.line,
-                Some("."),
+                Some(";"),
                 format!("expected quoted {description}"),
             )),
         }
     }
 
-    fn expect_period(&mut self) -> Result<(), ParseError> {
+    fn expect_semicolon(&mut self) -> Result<(), ParseError> {
         let token = self
             .next_token()
-            .ok_or_else(|| self.error(self.eof_line, None, "expected `.`"))?;
+            .ok_or_else(|| self.error(self.eof_line, None, "expected `;`"))?;
         match token.kind {
-            TokenKind::Period => Ok(()),
-            TokenKind::Word(word) => Err(self.error(token.line, Some(word), "expected `.`")),
+            TokenKind::Semicolon => Ok(()),
+            TokenKind::Word(word) => Err(self.error(token.line, Some(word), "expected `;`")),
             TokenKind::Quoted(_) => {
-                Err(self.error(token.line, Some("<quoted text>"), "expected `.`"))
+                Err(self.error(token.line, Some("<quoted text>"), "expected `;`"))
             }
         }
     }
@@ -585,7 +585,7 @@ impl<'source> Parser<'_, 'source> {
         let text = match token.kind {
             TokenKind::Word(word) => word,
             TokenKind::Quoted(_) => "<quoted text>",
-            TokenKind::Period => ".",
+            TokenKind::Semicolon => ";",
         };
         Err(self.error(token.line, Some(text), "unexpected text after end of order"))
     }
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn parses_header_with_spaces() {
-        let header = parse_order_file_header("orders.txt", "game ECRA-01 turn 7 .").unwrap();
+        let header = parse_order_file_header("orders.txt", "game ECRA-01 turn 7 ;").unwrap();
 
         assert_eq!(header.game.as_str(), "ECRA-01");
         assert_eq!(header.turn.number(), 7);
@@ -649,7 +649,7 @@ mod tests {
     #[test]
     fn requires_header_to_be_the_first_entry() {
         let error =
-            parse_order_file_header("orders.txt", "MOVE 1001 12.\ngame ECRA turn 7.").unwrap_err();
+            parse_order_file_header("orders.txt", "MOVE 1001 12;\ngame ECRA turn 7;").unwrap_err();
 
         assert_eq!(error.line(), 1);
         assert_eq!(error.offending_text(), Some("MOVE"));
@@ -671,16 +671,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_missing_period() {
+    fn rejects_a_missing_semicolon() {
         let error = parse_order_file_header("orders.txt", "game ECRA turn 7").unwrap_err();
 
         assert_eq!(error.line(), 1);
-        assert_eq!(error.explanation(), "expected `.`");
+        assert_eq!(error.explanation(), "expected `;`");
     }
 
     #[test]
     fn malformed_input_never_panics() {
-        for source in ["", ".", "game", "game .", "game ECRA", "game ECRA turn ."] {
+        for source in ["", ";", "game", "game ;", "game ECRA", "game ECRA turn ;"] {
             assert!(parse_order_file_header("bad.orders", source).is_err());
         }
     }
@@ -703,12 +703,12 @@ mod tests {
     fn parses_player_and_faction_authentication() {
         let player = parse_order_file_preamble(
             "player.orders",
-            "game ECRA turn 3. authenticate player 42 with token \"player secret\".",
+            "game ECRA turn 3; authenticate player 42 with token \"player secret\";",
         )
         .unwrap();
         let faction = parse_order_file_preamble(
             "faction.orders",
-            "game ECRA turn 3.\nauthenticate faction 91 with token \"faction-secret\" .",
+            "game ECRA turn 3;\nauthenticate faction 91 with token \"faction-secret\" ;",
         )
         .unwrap();
 
@@ -720,7 +720,7 @@ mod tests {
     fn requires_authentication_immediately_after_header() {
         let error = parse_order_file_preamble(
             "orders.txt",
-            "game ECRA turn 3. MOVE 1001 12. authenticate player 42 with token \"secret\".",
+            "game ECRA turn 3; MOVE 1001 12; authenticate player 42 with token \"secret\";",
         )
         .unwrap_err();
 
@@ -745,7 +745,7 @@ mod tests {
     fn authentication_token_must_be_quoted() {
         let error = parse_order_file_preamble(
             "orders.txt",
-            "game ECRA turn 3. authenticate player 42 with token not-quoted.",
+            "game ECRA turn 3; authenticate player 42 with token not-quoted;",
         )
         .unwrap_err();
 
@@ -757,9 +757,9 @@ mod tests {
     #[test]
     fn quoted_text_rejects_newlines_and_control_characters() {
         for source in [
-            "game ECRA turn 3. authenticate player 42 with token \"two\nlines\".",
-            "game ECRA turn 3. authenticate player 42 with token \"tab\there\".",
-            "game ECRA turn 3. authenticate player 42 with token \"delete\u{7f}here\".",
+            "game ECRA turn 3; authenticate player 42 with token \"two\nlines\";",
+            "game ECRA turn 3; authenticate player 42 with token \"tab\there\";",
+            "game ECRA turn 3; authenticate player 42 with token \"delete\u{7f}here\";",
         ] {
             let error = parse_order_file_preamble("orders.txt", source).unwrap_err();
             assert_eq!(
@@ -773,13 +773,13 @@ mod tests {
     fn quoted_text_has_no_escape_or_embedded_quote_syntax() {
         let error = parse_order_file_preamble(
             "orders.txt",
-            "game ECRA turn 3. authenticate player 42 with token \"first\"second\".",
+            "game ECRA turn 3; authenticate player 42 with token \"first\"second\";",
         )
         .unwrap_err();
 
         assert_eq!(
             error.explanation(),
-            "expected whitespace or `.` after quoted text"
+            "expected whitespace or `;` after quoted text"
         );
     }
 
@@ -787,7 +787,7 @@ mod tests {
     fn reports_unterminated_quoted_text() {
         let error = parse_order_file_preamble(
             "orders.txt",
-            "game ECRA turn 3.\nauthenticate player 42 with token \"never closed",
+            "game ECRA turn 3;\nauthenticate player 42 with token \"never closed",
         )
         .unwrap_err();
 
@@ -800,10 +800,10 @@ mod tests {
         let errors = check_order_file_syntax(
             "bad.orders",
             concat!(
-                "game ECRA turn tomorrow.\n",
-                "authenticate player no with token \"secret\".\n",
-                "MOVE entity 12.\n",
-                "TRANSFER 1 FOOD LOST many 2.\n",
+                "game ECRA turn tomorrow;\n",
+                "authenticate player no with token \"secret\";\n",
+                "MOVE entity 12;\n",
+                "TRANSFER 1 FOOD LOST many 2;\n",
             ),
         );
 
@@ -815,6 +815,23 @@ mod tests {
     }
 
     #[test]
+    fn semicolon_is_the_sync_point_when_an_amount_contains_a_period() {
+        let errors = check_order_file_syntax(
+            "decimal.orders",
+            concat!(
+                "game ECRA turn 3;\n",
+                "authenticate player 42 with token \"secret\";\n",
+                "TRANSFER 1001 FOOD AVAILABLE 25.5 1002;\n",
+                "MOVE 1001 12;\n",
+            ),
+        );
+
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].line(), 3);
+        assert_eq!(errors[0].offending_text(), Some("25.5"));
+    }
+
+    #[test]
     fn syntax_check_requires_game_and_authentication_orders() {
         let empty_errors = check_order_file_syntax("empty.orders", "");
         assert_eq!(empty_errors.len(), 2);
@@ -822,7 +839,7 @@ mod tests {
         assert!(empty_errors[1].explanation().contains("second order"));
 
         let errors =
-            check_order_file_syntax("bad.orders", "MOVE 1 2.\nTRANSFER 1 FOOD AVAILABLE 2 3.");
+            check_order_file_syntax("bad.orders", "MOVE 1 2;\nTRANSFER 1 FOOD AVAILABLE 2 3;");
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0].explanation(), "expected `game`");
         assert_eq!(errors[1].explanation(), "expected `authenticate`");
@@ -833,10 +850,10 @@ mod tests {
         let errors = check_order_file_syntax(
             "valid.orders",
             concat!(
-                "game ECRA turn 3.\n",
-                "authenticate player 42 with token \"secret\".\n",
-                "MOVE 1001 12.\n",
-                "TRANSFER 1001 FOOD AVAILABLE 25 1002.\n",
+                "game ECRA turn 3;\n",
+                "authenticate player 42 with token \"secret\";\n",
+                "MOVE 1001 12;\n",
+                "TRANSFER 1001 FOOD AVAILABLE 25 1002;\n",
             ),
         );
 

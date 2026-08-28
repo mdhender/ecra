@@ -1,4 +1,4 @@
-game ECRA-01 turn 7.
-authenticate email admiral.sato@example.com with token "opaque token.value".
-MOVE 1001 12.
-TRANSFER 1001 FOOD AVAILABLE 25 1002.
+game ECRA-01 turn 7;
+authenticate email admiral.sato@example.com with token "opaque token.value";
+MOVE 1001 12;
+TRANSFER 1001 FOOD AVAILABLE 25 1002;
