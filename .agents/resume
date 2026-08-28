@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.cargo/bin:$PATH"
+command -v cargo >/dev/null
+printf 'orb resume: Rust toolchain available\n'

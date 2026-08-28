@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+step_started=$SECONDS
+printf 'orb setup: configuring Rust stable\n'
+
+export PATH="$HOME/.cargo/bin:$PATH"
+
+if ! command -v rustup >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs |
+    sh -s -- -y --profile minimal --default-toolchain stable
+fi
+
+# rustup cannot alter the environment of this running script.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+
+if ! rustup toolchain list | grep -Eq '^stable(-[^[:space:]]+)?([[:space:]]|$)'; then
+  rustup toolchain install stable --profile minimal
+fi
+
+for component in clippy rustfmt; do
+  if ! rustup component list --toolchain stable |
+    grep -Eq "^${component}(-[^[:space:]]+)?[[:space:]].*\(installed\)$"; then
+    rustup component add --toolchain stable "$component"
+  fi
+done
+
+rustup default stable >/dev/null
+
+profile_marker='# ecra Rust toolchain'
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >>"$HOME/.bash_profile" <<'EOF'
+
+# ecra Rust toolchain
+if [ -f "$HOME/.cargo/env" ]; then
+  . "$HOME/.cargo/env"
+fi
+EOF
+fi
+
+printf 'orb setup: Rust ready in %ss\n' "$((SECONDS - step_started))"
+
+if [ -f Cargo.toml ]; then
+  step_started=$SECONDS
+  printf 'orb setup: fetching Cargo dependencies\n'
+  if [ -f Cargo.lock ]; then
+    cargo fetch --locked
+  else
+    cargo fetch
+  fi
+  printf 'orb setup: dependencies ready in %ss\n' "$((SECONDS - step_started))"
+else
+  printf 'orb setup: no Cargo manifest yet; dependency fetch skipped\n'
+fi
