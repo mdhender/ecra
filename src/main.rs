@@ -15,6 +15,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Print the application version
+    Version,
     /// Create a new game store
     New {
         /// Path of the store to create
@@ -46,6 +48,9 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn Error>> {
     match Cli::parse().command {
+        Command::Version => {
+            println!("ecra {}", env!("CARGO_PKG_VERSION"));
+        }
         Command::New { store } => {
             let store = GameStore::create(store)?;
             println!("Created ECRA store at {}", store.path().display());

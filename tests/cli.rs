@@ -10,10 +10,23 @@ fn help_lists_store_commands() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("version"));
     assert!(stdout.contains("new"));
     assert!(stdout.contains("manage"));
     assert!(stdout.contains("check-orders"));
     assert!(stdout.contains("help"));
+}
+
+#[test]
+fn prints_application_version() {
+    let output = ecra().arg("version").output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "ecra 0.1.0-beta\n"
+    );
+    assert!(output.stderr.is_empty());
 }
 
 #[test]
