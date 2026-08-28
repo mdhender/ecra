@@ -1,7 +1,9 @@
 use std::error::Error;
+use std::fs;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use ecra::orders::check_order_file_syntax;
 use ecra::storage::GameStore;
 
 #[derive(Debug, Parser)]
@@ -27,6 +29,11 @@ enum Command {
     SeedAccounts {
         /// Path of the store to seed
         store: PathBuf,
+    },
+    /// Check an order file for syntax errors
+    CheckOrders {
+        /// Path of the order file to check
+        file: PathBuf,
     },
 }
 
@@ -57,6 +64,23 @@ fn run() -> Result<(), Box<dyn Error>> {
                 "Created {created} test accounts in {}",
                 store.path().display()
             );
+        }
+        Command::CheckOrders { file } => {
+            let source = fs::read_to_string(&file)?;
+            let errors = check_order_file_syntax(file.display().to_string(), &source);
+            if errors.is_empty() {
+                println!("No syntax errors found in {}", file.display());
+            } else {
+                for error in &errors {
+                    eprintln!("{error}");
+                }
+                return Err(format!(
+                    "found {} syntax error{}",
+                    errors.len(),
+                    if errors.len() == 1 { "" } else { "s" }
+                )
+                .into());
+            }
         }
     }
     Ok(())

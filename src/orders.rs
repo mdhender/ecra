@@ -183,8 +183,97 @@ pub fn parse_order_file_preamble(
     })
 }
 
+/// Checks every order in a file and returns all syntax errors found.
+///
+/// Orders are terminated by periods. After an error, checking resumes at the
+/// next order so that one invocation can report independent errors throughout
+/// the file. The first two orders must be the game header and authentication
+/// order, respectively.
+pub fn check_order_file_syntax(filename: impl Into<String>, source: &str) -> Vec<ParseError> {
+    let filename = filename.into();
+    let eof_line = source.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let (tokens, mut errors) = tokenize_all(&filename, source);
+    let mut start = 0;
+    let mut order_index = 0;
+
+    for end in (0..tokens.len()).filter(|index| tokens[*index].kind == TokenKind::Period) {
+        check_order(
+            &filename,
+            &tokens[start..=end],
+            eof_line,
+            order_index,
+            &mut errors,
+        );
+        order_index += 1;
+        start = end + 1;
+    }
+
+    if start < tokens.len() {
+        check_order(
+            &filename,
+            &tokens[start..],
+            eof_line,
+            order_index,
+            &mut errors,
+        );
+        order_index += 1;
+    }
+
+    if order_index == 0 {
+        errors.push(ParseError {
+            filename: filename.clone(),
+            line: eof_line,
+            offending_text: None,
+            explanation: "expected `game` as the first order".to_owned(),
+        });
+    }
+    if order_index < 2 {
+        errors.push(ParseError {
+            filename,
+            line: eof_line,
+            offending_text: None,
+            explanation: "expected `authenticate` as the second order".to_owned(),
+        });
+    }
+
+    errors.sort_by_key(|error| error.line);
+    errors
+}
+
+fn check_order(
+    filename: &str,
+    tokens: &[Token<'_>],
+    eof_line: usize,
+    order_index: usize,
+    errors: &mut Vec<ParseError>,
+) {
+    let mut parser = Parser {
+        filename,
+        tokens,
+        position: 0,
+        eof_line,
+    };
+    let result = match order_index {
+        0 => parser.parse_header().map(|_| ()),
+        1 => parser.parse_authentication().map(|_| ()),
+        _ => parser.parse_player_order(),
+    };
+    if let Err(error) = result.and_then(|()| parser.expect_end()) {
+        errors.push(error);
+    }
+}
+
 fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, ParseError> {
+    let (tokens, errors) = tokenize_all(filename, source);
+    if let Some(error) = errors.into_iter().next() {
+        return Err(error);
+    }
+    Ok(tokens)
+}
+
+fn tokenize_all<'a>(filename: &str, source: &'a str) -> (Vec<Token<'a>>, Vec<ParseError>) {
     let mut tokens = Vec::new();
+    let mut errors = Vec::new();
     let mut index = 0;
     let mut line = 1;
 
@@ -206,6 +295,7 @@ fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, Parse
             index += character.len_utf8();
             let content_start = index;
             let mut closing_quote = None;
+            let mut malformed = false;
 
             while index < source.len() {
                 let character = source[index..]
@@ -217,28 +307,43 @@ fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, Parse
                     break;
                 }
                 if character.is_control() || (character.is_whitespace() && character != ' ') {
-                    return Err(ParseError {
-                        filename: filename.to_owned(),
-                        line,
-                        offending_text: None,
-                        explanation:
-                            "quoted text may contain spaces, but not newlines or control characters"
-                                .to_owned(),
-                    });
+                    if !malformed {
+                        errors.push(ParseError {
+                            filename: filename.to_owned(),
+                            line,
+                            offending_text: None,
+                            explanation:
+                                "quoted text may contain spaces, but not newlines or control characters"
+                                    .to_owned(),
+                        });
+                    }
+                    malformed = true;
+                    if character == '\n' {
+                        line += 1;
+                        index += character.len_utf8();
+                        break;
+                    }
                 }
                 index += character.len_utf8();
             }
 
-            let closing_quote = closing_quote.ok_or_else(|| ParseError {
-                filename: filename.to_owned(),
-                line: quote_line,
-                offending_text: None,
-                explanation: "unterminated quoted text".to_owned(),
-            })?;
-            tokens.push(Token {
-                kind: TokenKind::Quoted(&source[content_start..closing_quote]),
-                line: quote_line,
-            });
+            let Some(closing_quote) = closing_quote else {
+                if !malformed {
+                    errors.push(ParseError {
+                        filename: filename.to_owned(),
+                        line: quote_line,
+                        offending_text: None,
+                        explanation: "unterminated quoted text".to_owned(),
+                    });
+                }
+                continue;
+            };
+            if !malformed {
+                tokens.push(Token {
+                    kind: TokenKind::Quoted(&source[content_start..closing_quote]),
+                    line: quote_line,
+                });
+            }
             index = closing_quote + '"'.len_utf8();
 
             if index < source.len() {
@@ -253,7 +358,7 @@ fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, Parse
                     });
                     index += next.len_utf8();
                 } else if !next.is_whitespace() {
-                    return Err(ParseError {
+                    errors.push(ParseError {
                         filename: filename.to_owned(),
                         line,
                         offending_text: Some(next.to_string()),
@@ -278,7 +383,7 @@ fn tokenize<'a>(filename: &str, source: &'a str) -> Result<Vec<Token<'a>>, Parse
         push_word_or_terminated_word(&mut tokens, &source[word_start..index], line);
     }
 
-    Ok(tokens)
+    (tokens, errors)
 }
 
 fn push_word_or_terminated_word<'a>(tokens: &mut Vec<Token<'a>>, word: &'a str, line: usize) {
@@ -356,6 +461,41 @@ impl<'source> Parser<'_, 'source> {
         self.expect_period()?;
 
         Ok((owner, token))
+    }
+
+    fn parse_player_order(&mut self) -> Result<(), ParseError> {
+        let command = self.take_word("order name")?;
+        match command {
+            "MOVE" => {
+                self.take_u64("entity ID")?;
+                self.take_u64("destination ID")?;
+            }
+            "TRANSFER" => {
+                self.take_u64("source entity ID")?;
+                self.take_word("unit")?;
+                let status = self.take_word("inventory status")?;
+                if !matches!(status, "AVAILABLE" | "RESERVED" | "DAMAGED") {
+                    return Err(self.error_at_current_or_previous(
+                        Some(status),
+                        "expected inventory status `AVAILABLE`, `RESERVED`, or `DAMAGED`",
+                    ));
+                }
+                self.take_u64("quantity")?;
+                self.take_u64("destination entity ID")?;
+            }
+            other => {
+                return Err(self.error_at_current_or_previous(
+                    Some(other),
+                    "expected order `MOVE` or `TRANSFER`",
+                ));
+            }
+        }
+        self.expect_period()
+    }
+
+    fn take_u64(&mut self, description: &str) -> Result<u64, ParseError> {
+        let text = self.take_word(description)?;
+        self.parse_id(text, description)
     }
 
     fn parse_id(&self, text: &str, description: &str) -> Result<u64, ParseError> {
@@ -436,6 +576,18 @@ impl<'source> Parser<'_, 'source> {
                 Err(self.error(token.line, Some("<quoted text>"), "expected `.`"))
             }
         }
+    }
+
+    fn expect_end(&mut self) -> Result<(), ParseError> {
+        let Some(token) = self.next_token() else {
+            return Ok(());
+        };
+        let text = match token.kind {
+            TokenKind::Word(word) => word,
+            TokenKind::Quoted(_) => "<quoted text>",
+            TokenKind::Period => ".",
+        };
+        Err(self.error(token.line, Some(text), "unexpected text after end of order"))
     }
 
     fn next_token(&mut self) -> Option<Token<'source>> {
@@ -641,5 +793,53 @@ mod tests {
 
         assert_eq!(error.line(), 2);
         assert_eq!(error.explanation(), "unterminated quoted text");
+    }
+
+    #[test]
+    fn syntax_check_reports_independent_errors_and_continues() {
+        let errors = check_order_file_syntax(
+            "bad.orders",
+            concat!(
+                "game ECRA turn tomorrow.\n",
+                "authenticate player no with token \"secret\".\n",
+                "MOVE entity 12.\n",
+                "TRANSFER 1 FOOD LOST many 2.\n",
+            ),
+        );
+
+        assert_eq!(errors.len(), 4);
+        assert_eq!(errors[0].line(), 1);
+        assert_eq!(errors[1].line(), 2);
+        assert_eq!(errors[2].line(), 3);
+        assert_eq!(errors[3].line(), 4);
+    }
+
+    #[test]
+    fn syntax_check_requires_game_and_authentication_orders() {
+        let empty_errors = check_order_file_syntax("empty.orders", "");
+        assert_eq!(empty_errors.len(), 2);
+        assert!(empty_errors[0].explanation().contains("first order"));
+        assert!(empty_errors[1].explanation().contains("second order"));
+
+        let errors =
+            check_order_file_syntax("bad.orders", "MOVE 1 2.\nTRANSFER 1 FOOD AVAILABLE 2 3.");
+        assert_eq!(errors.len(), 2);
+        assert_eq!(errors[0].explanation(), "expected `game`");
+        assert_eq!(errors[1].explanation(), "expected `authenticate`");
+    }
+
+    #[test]
+    fn syntax_check_accepts_a_complete_order_file() {
+        let errors = check_order_file_syntax(
+            "valid.orders",
+            concat!(
+                "game ECRA turn 3.\n",
+                "authenticate player 42 with token \"secret\".\n",
+                "MOVE 1001 12.\n",
+                "TRANSFER 1001 FOOD AVAILABLE 25 1002.\n",
+            ),
+        );
+
+        assert!(errors.is_empty());
     }
 }

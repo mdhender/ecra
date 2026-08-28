@@ -12,6 +12,7 @@ fn help_lists_store_commands() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("new"));
     assert!(stdout.contains("manage"));
+    assert!(stdout.contains("check-orders"));
     assert!(stdout.contains("help"));
 }
 
@@ -149,4 +150,44 @@ fn seed_accounts_is_idempotent() {
             .unwrap()
             .contains("Created 0")
     );
+}
+
+#[test]
+fn check_orders_succeeds_for_valid_syntax() {
+    let output = ecra()
+        .args([
+            "check-orders",
+            "tests/fixtures/orders/valid-complete.orders",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("No syntax errors found")
+    );
+}
+
+#[test]
+fn check_orders_reports_all_errors_and_fails() {
+    let output = ecra()
+        .args([
+            "check-orders",
+            "tests/fixtures/orders/multiple-syntax-errors.orders",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("multiple-syntax-errors.orders:1:"));
+    assert!(stderr.contains("multiple-syntax-errors.orders:2:"));
+    assert!(stderr.contains("multiple-syntax-errors.orders:3:"));
+    assert!(stderr.contains("found 3 syntax errors"));
 }
