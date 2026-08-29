@@ -6,7 +6,8 @@ ECRA is being built around pure turn processing: an immutable `GameState` plus
 validated orders will produce an explicit `TurnResult`. The architecture requires
 append-only game history and reproducible facts, states, and reports. Turn resolution,
 historical facts, and player/turn reporting are planned but not yet implemented; an
-initial deterministic stellia report is available from the CLI.
+initial deterministic stellia report and a game-player assignment report are available
+from the CLI.
 
 The project is at `0.1.0-beta`. See [AGENTS.md](AGENTS.md) for the architectural
 invariants and [docs/plan/initializing.md](docs/plan/initializing.md) for the
@@ -36,7 +37,9 @@ cargo build --release    # optimized binary at target/release/ecra
 ecra version                        Print the application version
 ecra new <store>                    Create a new game store
 ecra generate-game <store> <code>   Generate a game (`--seed` and `--minimum-distance` are optional)
+ecra add-players <store> <code> <email>...  Assign players to a game idempotently
 ecra report stellia <store> <code>  List stellia (`--json <file>` saves deterministic JSON)
+ecra report players <store> <code>  List assigned players (`--json <file>` saves deterministic JSON)
 ecra manage <store>                 Open and inspect an existing game store
 ecra seed-accounts <store>          Seed an existing store with accounts for testing
 ecra check-orders <file>            Check an order file for syntax errors
@@ -59,6 +62,11 @@ generated seed is recorded and printed so the game can still be replayed.
 `(x, y, z)` coordinates and then ID. Pass `--json <file>` to save the same sorted data
 as pretty-printed JSON with a trailing newline, suitable for golden test files.
 
+`add-players` assigns one or more email addresses to an existing game. Assignments are
+idempotent: duplicate addresses in one command or a later command do not change the
+game. `report players` lists assigned addresses in email order and supports the same
+`--json <file>` behavior as the stellia report.
+
 `check-orders` needs no store: it reads a file, reports every independent syntax
 error, and exits non-zero if any were found. `import-orders` persists the raw
 submission first, then parses the persisted source, so a file with syntax errors is
@@ -77,6 +85,8 @@ Every command below is reproducible from a clean checkout:
 cargo run -- new /tmp/demo.redb
 cargo run -- generate-game /tmp/demo.redb ECRA-01 --seed 42
 cargo run -- seed-accounts /tmp/demo.redb
+cargo run -- add-players /tmp/demo.redb ECRA-01 admiral.sato@example.com
+cargo run -- report players /tmp/demo.redb ECRA-01
 cargo run -- check-orders tests/fixtures/orders/valid-complete.orders
 cargo run -- import-orders /tmp/demo.redb tests/fixtures/orders/valid-complete.orders
 cargo run -- manage /tmp/demo.redb
@@ -88,11 +98,14 @@ Which produces:
 Created ECRA store at /tmp/demo.redb
 Generated game ECRA-01 with seed 42 (status: setup, stellia: 100, minimum distance: 3)
 Created 13 test accounts in /tmp/demo.redb
+Added 1 player to game ECRA-01
+EMAIL
+admiral.sato@example.com
 No syntax errors found in tests/fixtures/orders/valid-complete.orders
 Imported tests/fixtures/orders/valid-complete.orders as order import 1
 Parsed 2 player orders successfully
 Store: /tmp/demo.redb
-Format version: 2
+Format version: 3
 Current turn: 1
 Games: 1
 ```

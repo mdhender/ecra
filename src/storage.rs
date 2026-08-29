@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::accounts::{Account, AccountRole};
 use crate::game::{
-    Coordinates, Game, GameCode, GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE,
+    Coordinates, Game, GameCode, GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE, Player,
     STELLIA_PER_GAME, Star, StarId, Stellium, StelliumId,
 };
 
@@ -19,6 +19,7 @@ const GAME_SEEDS: TableDefinition<&str, u64> = TableDefinition::new("game_seeds"
 const GAME_STATUSES: TableDefinition<&str, &str> = TableDefinition::new("game_statuses");
 const GAME_MINIMUM_STELLIUM_DISTANCES: TableDefinition<&str, u8> =
     TableDefinition::new("game_minimum_stellium_distances");
+const GAME_PLAYERS: TableDefinition<&str, u8> = TableDefinition::new("game_players");
 const STELLIUM_STAR_COUNTS: TableDefinition<&str, u8> =
     TableDefinition::new("stellium_star_counts");
 const STELLIUM_X_COORDINATES: TableDefinition<&str, i8> =
@@ -38,8 +39,8 @@ const ORDER_IMPORT_DIAGNOSTICS: TableDefinition<u64, &str> =
 const APPLICATION_KEY: &str = "application";
 const APPLICATION_VALUE: &str = "ecra";
 const FORMAT_VERSION_KEY: &str = "format_version";
-const FORMAT_VERSION_VALUE: &str = "2";
-const SUPPORTED_FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION_VALUE: &str = "3";
+const SUPPORTED_FORMAT_VERSION: u32 = 3;
 const CURRENT_TURN_KEY: &str = "current_turn";
 const INITIAL_TURN: &str = "1";
 const NEXT_ORDER_IMPORT_KEY: &str = "next_order_import";
@@ -301,6 +302,9 @@ impl GameStore {
         let minimum_distances = read
             .open_table(GAME_MINIMUM_STELLIUM_DISTANCES)
             .map_err(|source| database_error(&self.path, source))?;
+        let game_players = read
+            .open_table(GAME_PLAYERS)
+            .map_err(|source| database_error(&self.path, source))?;
         let star_counts = read
             .open_table(STELLIUM_STAR_COUNTS)
             .map_err(|source| database_error(&self.path, source))?;
@@ -395,6 +399,20 @@ impl GameStore {
                 stars,
             });
         }
+        let player_prefix = format!("{}:", code.as_str());
+        let mut players = Vec::new();
+        for entry in game_players
+            .iter()
+            .map_err(|source| database_error(&self.path, source))?
+        {
+            let (key, _) = entry.map_err(|source| database_error(&self.path, source))?;
+            if let Some(email) = key.value().strip_prefix(&player_prefix) {
+                players.push(Player {
+                    email: email.to_owned(),
+                });
+            }
+        }
+        players.sort();
 
         Ok(Game {
             code: code.clone(),
@@ -402,7 +420,52 @@ impl GameStore {
             minimum_stellium_distance,
             status,
             stellia,
+            players,
         })
+    }
+
+    /// Atomically assigns players to an existing game, ignoring existing assignments.
+    pub fn add_players(&self, code: &GameCode, players: &[Player]) -> Result<usize, StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        {
+            let games = write
+                .open_table(GAME_SEEDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            if games
+                .get(code.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::GameNotFound(code.to_string()));
+            }
+        }
+
+        let mut created = 0;
+        {
+            let mut assignments = write
+                .open_table(GAME_PLAYERS)
+                .map_err(|source| database_error(&self.path, source))?;
+            for player in players {
+                let key = player_key(code.as_str(), &player.email);
+                if assignments
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .is_none()
+                {
+                    assignments
+                        .insert(key.as_str(), 1)
+                        .map_err(|source| database_error(&self.path, source))?;
+                    created += 1;
+                }
+            }
+        }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(created)
     }
 
     pub fn game_count(&self) -> Result<u64, StoreError> {
@@ -680,6 +743,9 @@ fn database_tables(write: &redb::WriteTransaction, path: &Path) -> Result<(), St
         .open_table(GAME_MINIMUM_STELLIUM_DISTANCES)
         .map_err(|source| database_error(path, source))?;
     write
+        .open_table(GAME_PLAYERS)
+        .map_err(|source| database_error(path, source))?;
+    write
         .open_table(STELLIUM_STAR_COUNTS)
         .map_err(|source| database_error(path, source))?;
     write
@@ -767,6 +833,10 @@ fn stellium_key(code: &str, id: StelliumId) -> String {
     format!("{code}:{:03}", id.number())
 }
 
+fn player_key(code: &str, email: &str) -> String {
+    format!("{code}:{email}")
+}
+
 fn invalid_game(path: &Path, code: &GameCode, reason: &str) -> StoreError {
     StoreError::InvalidStore {
         path: path.to_owned(),
@@ -788,7 +858,7 @@ mod tests {
         assert_eq!(
             store.info().unwrap(),
             StoreInfo {
-                format_version: 2,
+                format_version: 3,
                 current_turn: 1
             }
         );
@@ -798,7 +868,7 @@ mod tests {
         assert_eq!(
             reopened.info().unwrap(),
             StoreInfo {
-                format_version: 2,
+                format_version: 3,
                 current_turn: 1
             }
         );
@@ -919,5 +989,63 @@ mod tests {
             Err(StoreError::GameAlreadyExists(code)) if code == "SAME"
         ));
         assert_eq!(store.load_game(&first.code).unwrap(), first);
+    }
+
+    #[test]
+    fn adds_players_idempotently_and_reopens_them_in_email_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        let store = GameStore::create(&path).unwrap();
+        let game = crate::game::generate_game(
+            GameCode::new("PLAYERS").unwrap(),
+            crate::game::GenerateGameOptions::default(),
+        )
+        .unwrap();
+        store.create_game(&game).unwrap();
+        let players = vec![
+            Player {
+                email: "zoe@example.com".to_owned(),
+            },
+            Player {
+                email: "amy@example.com".to_owned(),
+            },
+            Player {
+                email: "zoe@example.com".to_owned(),
+            },
+        ];
+
+        assert_eq!(store.add_players(&game.code, &players).unwrap(), 2);
+        assert_eq!(store.add_players(&game.code, &players).unwrap(), 0);
+        drop(store);
+
+        let reopened = GameStore::open(path).unwrap();
+        assert_eq!(
+            reopened.load_game(&game.code).unwrap().players,
+            vec![
+                Player {
+                    email: "amy@example.com".to_owned()
+                },
+                Player {
+                    email: "zoe@example.com".to_owned()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_players_to_a_missing_game_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GameStore::create(directory.path().join("game.redb")).unwrap();
+        let code = GameCode::new("MISSING").unwrap();
+
+        assert!(matches!(
+            store.add_players(
+                &code,
+                &[Player {
+                    email: "player@example.com".to_owned()
+                }]
+            ),
+            Err(StoreError::GameNotFound(found)) if found == "MISSING"
+        ));
     }
 }

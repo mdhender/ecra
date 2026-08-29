@@ -4,9 +4,11 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ecra::app::import_order_file;
-use ecra::game::{DEFAULT_MINIMUM_STELLIUM_DISTANCE, GameCode, GenerateGameOptions, generate_game};
+use ecra::game::{
+    DEFAULT_MINIMUM_STELLIUM_DISTANCE, GameCode, GenerateGameOptions, Player, generate_game,
+};
 use ecra::orders::check_order_file_syntax;
-use ecra::reports::{stellium_list, stellium_list_json};
+use ecra::reports::{player_list, player_list_json, stellium_list, stellium_list_json};
 use ecra::storage::GameStore;
 
 #[derive(Debug, Parser)]
@@ -37,6 +39,16 @@ enum Command {
         /// Minimum Euclidean distance between stellia
         #[arg(long, default_value_t = DEFAULT_MINIMUM_STELLIUM_DISTANCE)]
         minimum_distance: u8,
+    },
+    /// Add players to an existing game
+    AddPlayers {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Email addresses to assign to the game
+        #[arg(required = true)]
+        emails: Vec<String>,
     },
     /// Generate reports from a stored game
     Report {
@@ -69,6 +81,16 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ReportCommand {
+    /// List players assigned to a game
+    Players {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Save the list as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
     /// List stellia, their coordinates, and their star counts
     Stellia {
         /// Path of the game store
@@ -121,7 +143,39 @@ fn run() -> Result<(), Box<dyn Error>> {
                 game.minimum_stellium_distance
             );
         }
+        Command::AddPlayers {
+            store,
+            code,
+            emails,
+        } => {
+            let store = GameStore::open(store)?;
+            let code = GameCode::new(code)?;
+            let players = emails
+                .into_iter()
+                .map(|email| Player { email })
+                .collect::<Vec<_>>();
+            let created = store.add_players(&code, &players)?;
+            println!(
+                "Added {created} player{} to game {code}",
+                if created == 1 { "" } else { "s" }
+            );
+        }
         Command::Report { report } => match report {
+            ReportCommand::Players { store, code, json } => {
+                let store = GameStore::open(store)?;
+                let game = store.load_game(&GameCode::new(code)?)?;
+                let entries = player_list(&game);
+
+                if let Some(path) = json {
+                    fs::write(&path, player_list_json(&entries)?)?;
+                    println!("Saved players report to {}", path.display());
+                } else {
+                    println!("EMAIL");
+                    for entry in entries {
+                        println!("{}", entry.email);
+                    }
+                }
+            }
             ReportCommand::Stellia { store, code, json } => {
                 let store = GameStore::open(store)?;
                 let game = store.load_game(&GameCode::new(code)?)?;

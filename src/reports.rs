@@ -2,6 +2,11 @@ use serde::Serialize;
 
 use crate::game::Game;
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PlayerListEntry {
+    pub email: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct StelliumListEntry {
     pub id: u32,
@@ -28,6 +33,26 @@ pub fn stellium_list(game: &Game) -> Vec<StelliumListEntry> {
 }
 
 pub fn stellium_list_json(entries: &[StelliumListEntry]) -> Result<String, serde_json::Error> {
+    list_json(entries)
+}
+
+pub fn player_list(game: &Game) -> Vec<PlayerListEntry> {
+    let mut entries = game
+        .players
+        .iter()
+        .map(|player| PlayerListEntry {
+            email: player.email.clone(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.email.cmp(&right.email));
+    entries
+}
+
+pub fn player_list_json(entries: &[PlayerListEntry]) -> Result<String, serde_json::Error> {
+    list_json(entries)
+}
+
+fn list_json<T: Serialize + ?Sized>(entries: &T) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(entries).map(|mut json| {
         json.push('\n');
         json
@@ -73,6 +98,35 @@ mod tests {
         assert_eq!(
             json,
             "[\n  {\n    \"id\": 7,\n    \"x\": -2,\n    \"y\": 3,\n    \"z\": 4,\n    \"stars\": 5\n  }\n]\n"
+        );
+    }
+
+    #[test]
+    fn players_are_sorted_by_email() {
+        let mut game = generate_game(
+            GameCode::new("PLAYERS").unwrap(),
+            GenerateGameOptions::default(),
+        )
+        .unwrap();
+        game.players = vec![
+            crate::game::Player {
+                email: "zoe@example.com".to_owned(),
+            },
+            crate::game::Player {
+                email: "amy@example.com".to_owned(),
+            },
+        ];
+
+        assert_eq!(
+            player_list(&game),
+            vec![
+                PlayerListEntry {
+                    email: "amy@example.com".to_owned()
+                },
+                PlayerListEntry {
+                    email: "zoe@example.com".to_owned()
+                }
+            ]
         );
     }
 }

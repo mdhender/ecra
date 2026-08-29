@@ -13,6 +13,7 @@ fn help_lists_store_commands() {
     assert!(stdout.contains("version"));
     assert!(stdout.contains("new"));
     assert!(stdout.contains("generate-game"));
+    assert!(stdout.contains("add-players"));
     assert!(stdout.contains("report"));
     assert!(stdout.contains("manage"));
     assert!(stdout.contains("check-orders"));
@@ -92,6 +93,92 @@ fn reports_stellia_to_stdout_and_deterministic_json() {
 }
 
 #[test]
+fn adds_players_idempotently_and_reports_text_and_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let json = directory.path().join("players.json");
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ecra()
+            .args([
+                "generate-game",
+                store.to_str().unwrap(),
+                "PLAYERS",
+                "--seed",
+                "42",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let added = ecra()
+        .args([
+            "add-players",
+            store.to_str().unwrap(),
+            "PLAYERS",
+            "zoe@example.com",
+            "amy@example.com",
+            "zoe@example.com",
+        ])
+        .output()
+        .unwrap();
+    assert!(added.status.success());
+    assert_eq!(
+        String::from_utf8(added.stdout).unwrap(),
+        "Added 2 players to game PLAYERS\n"
+    );
+
+    let repeated = ecra()
+        .args([
+            "add-players",
+            store.to_str().unwrap(),
+            "PLAYERS",
+            "amy@example.com",
+        ])
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    assert_eq!(
+        String::from_utf8(repeated.stdout).unwrap(),
+        "Added 0 players to game PLAYERS\n"
+    );
+
+    let text = ecra()
+        .args(["report", "players", store.to_str().unwrap(), "PLAYERS"])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    assert_eq!(
+        String::from_utf8(text.stdout).unwrap(),
+        "EMAIL\namy@example.com\nzoe@example.com\n"
+    );
+
+    let saved = ecra()
+        .args([
+            "report",
+            "players",
+            store.to_str().unwrap(),
+            "PLAYERS",
+            "--json",
+            json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(saved.status.success());
+    assert_eq!(
+        std::fs::read_to_string(json).unwrap(),
+        "[\n  {\n    \"email\": \"amy@example.com\"\n  },\n  {\n    \"email\": \"zoe@example.com\"\n  }\n]\n"
+    );
+}
+
+#[test]
 fn prints_application_version() {
     let output = ecra().arg("version").output().unwrap();
 
@@ -129,7 +216,7 @@ fn creates_then_manages_a_store() {
         String::from_utf8_lossy(&managed.stderr)
     );
     let stdout = String::from_utf8(managed.stdout).unwrap();
-    assert!(stdout.contains("Format version: 2"));
+    assert!(stdout.contains("Format version: 3"));
     assert!(stdout.contains("Current turn: 1"));
 }
 

@@ -134,6 +134,11 @@ pub struct Star {
     pub id: StarId,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Player {
+    pub email: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Game {
     pub code: GameCode,
@@ -141,6 +146,7 @@ pub struct Game {
     pub minimum_stellium_distance: u8,
     pub status: GameStatus,
     pub stellia: Vec<Stellium>,
+    pub players: Vec<Player>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -196,6 +202,7 @@ pub fn generate_game(
         minimum_stellium_distance,
         status: GameStatus::Setup,
         stellia,
+        players: Vec::new(),
     })
 }
 
