@@ -7,7 +7,8 @@ use thiserror::Error;
 
 use crate::accounts::{Account, AccountRole};
 use crate::game::{
-    Game, GameCode, GameStatus, STELLIA_PER_GAME, Star, StarId, Stellium, StelliumId,
+    Coordinates, Game, GameCode, GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE,
+    STELLIA_PER_GAME, Star, StarId, Stellium, StelliumId,
 };
 
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadata");
@@ -16,8 +17,16 @@ const ACCOUNT_TOKENS: TableDefinition<u32, &str> = TableDefinition::new("account
 const ACCOUNT_ROLES: TableDefinition<u32, &str> = TableDefinition::new("account_roles");
 const GAME_SEEDS: TableDefinition<&str, u64> = TableDefinition::new("game_seeds");
 const GAME_STATUSES: TableDefinition<&str, &str> = TableDefinition::new("game_statuses");
+const GAME_MINIMUM_STELLIUM_DISTANCES: TableDefinition<&str, u8> =
+    TableDefinition::new("game_minimum_stellium_distances");
 const STELLIUM_STAR_COUNTS: TableDefinition<&str, u8> =
     TableDefinition::new("stellium_star_counts");
+const STELLIUM_X_COORDINATES: TableDefinition<&str, i8> =
+    TableDefinition::new("stellium_x_coordinates");
+const STELLIUM_Y_COORDINATES: TableDefinition<&str, i8> =
+    TableDefinition::new("stellium_y_coordinates");
+const STELLIUM_Z_COORDINATES: TableDefinition<&str, i8> =
+    TableDefinition::new("stellium_z_coordinates");
 const ORDER_IMPORT_FILENAMES: TableDefinition<u64, &str> =
     TableDefinition::new("order_import_filenames");
 const ORDER_IMPORT_SOURCES: TableDefinition<u64, &str> =
@@ -29,8 +38,8 @@ const ORDER_IMPORT_DIAGNOSTICS: TableDefinition<u64, &str> =
 const APPLICATION_KEY: &str = "application";
 const APPLICATION_VALUE: &str = "ecra";
 const FORMAT_VERSION_KEY: &str = "format_version";
-const FORMAT_VERSION_VALUE: &str = "1";
-const SUPPORTED_FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION_VALUE: &str = "2";
+const SUPPORTED_FORMAT_VERSION: u32 = 2;
 const CURRENT_TURN_KEY: &str = "current_turn";
 const INITIAL_TURN: &str = "1";
 const NEXT_ORDER_IMPORT_KEY: &str = "next_order_import";
@@ -238,14 +247,37 @@ impl GameStore {
             .map_err(|source| database_error(&self.path, source))?
             .insert(code, game.status.as_str())
             .map_err(|source| database_error(&self.path, source))?;
+        write
+            .open_table(GAME_MINIMUM_STELLIUM_DISTANCES)
+            .map_err(|source| database_error(&self.path, source))?
+            .insert(code, game.minimum_stellium_distance)
+            .map_err(|source| database_error(&self.path, source))?;
         {
             let mut star_counts = write
                 .open_table(STELLIUM_STAR_COUNTS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut x_coordinates = write
+                .open_table(STELLIUM_X_COORDINATES)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut y_coordinates = write
+                .open_table(STELLIUM_Y_COORDINATES)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut z_coordinates = write
+                .open_table(STELLIUM_Z_COORDINATES)
                 .map_err(|source| database_error(&self.path, source))?;
             for stellium in &game.stellia {
                 let key = stellium_key(code, stellium.id);
                 star_counts
                     .insert(key.as_str(), stellium.star_count() as u8)
+                    .map_err(|source| database_error(&self.path, source))?;
+                x_coordinates
+                    .insert(key.as_str(), stellium.coordinates.x)
+                    .map_err(|source| database_error(&self.path, source))?;
+                y_coordinates
+                    .insert(key.as_str(), stellium.coordinates.y)
+                    .map_err(|source| database_error(&self.path, source))?;
+                z_coordinates
+                    .insert(key.as_str(), stellium.coordinates.z)
                     .map_err(|source| database_error(&self.path, source))?;
             }
         }
@@ -266,8 +298,20 @@ impl GameStore {
         let statuses = read
             .open_table(GAME_STATUSES)
             .map_err(|source| database_error(&self.path, source))?;
+        let minimum_distances = read
+            .open_table(GAME_MINIMUM_STELLIUM_DISTANCES)
+            .map_err(|source| database_error(&self.path, source))?;
         let star_counts = read
             .open_table(STELLIUM_STAR_COUNTS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let x_coordinates = read
+            .open_table(STELLIUM_X_COORDINATES)
+            .map_err(|source| database_error(&self.path, source))?;
+        let y_coordinates = read
+            .open_table(STELLIUM_Y_COORDINATES)
+            .map_err(|source| database_error(&self.path, source))?;
+        let z_coordinates = read
+            .open_table(STELLIUM_Z_COORDINATES)
             .map_err(|source| database_error(&self.path, source))?;
         let missing = || StoreError::GameNotFound(code.to_string());
 
@@ -283,6 +327,13 @@ impl GameStore {
             .ok_or_else(|| invalid_game(&self.path, code, "status is missing"))?;
         let status = GameStatus::from_str(&status_text)
             .ok_or_else(|| invalid_game(&self.path, code, "status is invalid"))?;
+        let minimum_stellium_distance = minimum_distances
+            .get(code.as_str())
+            .map_err(|source| database_error(&self.path, source))?
+            .map(|value| value.value())
+            .ok_or_else(|| {
+                invalid_game(&self.path, code, "minimum stellium distance is missing")
+            })?;
         let mut stellia = Vec::with_capacity(STELLIA_PER_GAME);
         for number in 1..=STELLIA_PER_GAME as u32 {
             let id = StelliumId::new(number);
@@ -304,12 +355,51 @@ impl GameStore {
                     id: StarId::new(number),
                 })
                 .collect();
-            stellia.push(Stellium { id, stars });
+            let coordinates = Coordinates {
+                x: x_coordinates
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value())
+                    .ok_or_else(|| {
+                        invalid_game(&self.path, code, "stellium coordinates are incomplete")
+                    })?,
+                y: y_coordinates
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value())
+                    .ok_or_else(|| {
+                        invalid_game(&self.path, code, "stellium coordinates are incomplete")
+                    })?,
+                z: z_coordinates
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value())
+                    .ok_or_else(|| {
+                        invalid_game(&self.path, code, "stellium coordinates are incomplete")
+                    })?,
+            };
+            if !(MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.x)
+                || !(MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.y)
+                || !(MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.z)
+                || coordinates == (Coordinates { x: 0, y: 0, z: 0 })
+            {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "stellium coordinates are invalid",
+                ));
+            }
+            stellia.push(Stellium {
+                id,
+                coordinates,
+                stars,
+            });
         }
 
         Ok(Game {
             code: code.clone(),
             seed,
+            minimum_stellium_distance,
             status,
             stellia,
         })
@@ -587,7 +677,19 @@ fn database_tables(write: &redb::WriteTransaction, path: &Path) -> Result<(), St
         .open_table(GAME_STATUSES)
         .map_err(|source| database_error(path, source))?;
     write
+        .open_table(GAME_MINIMUM_STELLIUM_DISTANCES)
+        .map_err(|source| database_error(path, source))?;
+    write
         .open_table(STELLIUM_STAR_COUNTS)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(STELLIUM_X_COORDINATES)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(STELLIUM_Y_COORDINATES)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(STELLIUM_Z_COORDINATES)
         .map_err(|source| database_error(path, source))?;
     Ok(())
 }
@@ -686,7 +788,7 @@ mod tests {
         assert_eq!(
             store.info().unwrap(),
             StoreInfo {
-                format_version: 1,
+                format_version: 2,
                 current_turn: 1
             }
         );
@@ -696,7 +798,7 @@ mod tests {
         assert_eq!(
             reopened.info().unwrap(),
             StoreInfo {
-                format_version: 1,
+                format_version: 2,
                 current_turn: 1
             }
         );
@@ -763,8 +865,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("game.redb");
         let store = GameStore::create(&path).unwrap();
-        let first = crate::game::generate_game(GameCode::new("FIRST").unwrap(), Some(10));
-        let second = crate::game::generate_game(GameCode::new("SECOND").unwrap(), Some(20));
+        let first = crate::game::generate_game(
+            GameCode::new("FIRST").unwrap(),
+            crate::game::GenerateGameOptions {
+                seed: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let second = crate::game::generate_game(
+            GameCode::new("SECOND").unwrap(),
+            crate::game::GenerateGameOptions {
+                seed: Some(20),
+                minimum_stellium_distance: 4,
+            },
+        )
+        .unwrap();
 
         store.create_game(&first).unwrap();
         store.create_game(&second).unwrap();
@@ -780,8 +896,22 @@ mod tests {
     fn rejects_a_duplicate_game_code_without_changing_the_game() {
         let directory = tempfile::tempdir().unwrap();
         let store = GameStore::create(directory.path().join("game.redb")).unwrap();
-        let first = crate::game::generate_game(GameCode::new("SAME").unwrap(), Some(10));
-        let duplicate = crate::game::generate_game(GameCode::new("SAME").unwrap(), Some(20));
+        let first = crate::game::generate_game(
+            GameCode::new("SAME").unwrap(),
+            crate::game::GenerateGameOptions {
+                seed: Some(10),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let duplicate = crate::game::generate_game(
+            GameCode::new("SAME").unwrap(),
+            crate::game::GenerateGameOptions {
+                seed: Some(20),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         store.create_game(&first).unwrap();
         assert!(matches!(

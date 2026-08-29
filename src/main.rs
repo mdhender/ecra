@@ -4,8 +4,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ecra::app::import_order_file;
-use ecra::game::{GameCode, generate_game};
+use ecra::game::{DEFAULT_MINIMUM_STELLIUM_DISTANCE, GameCode, GenerateGameOptions, generate_game};
 use ecra::orders::check_order_file_syntax;
+use ecra::reports::{stellium_list, stellium_list_json};
 use ecra::storage::GameStore;
 
 #[derive(Debug, Parser)]
@@ -33,6 +34,14 @@ enum Command {
         /// Base seed for deterministic generation
         #[arg(long)]
         seed: Option<u64>,
+        /// Minimum Euclidean distance between stellia
+        #[arg(long, default_value_t = DEFAULT_MINIMUM_STELLIUM_DISTANCE)]
+        minimum_distance: u8,
+    },
+    /// Generate reports from a stored game
+    Report {
+        #[command(subcommand)]
+        report: ReportCommand,
     },
     /// Open and inspect an existing game store
     Manage {
@@ -58,6 +67,20 @@ enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum ReportCommand {
+    /// List stellia, their coordinates, and their star counts
+    Stellia {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Save the list as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("error: {error}");
@@ -74,18 +97,50 @@ fn run() -> Result<(), Box<dyn Error>> {
             let store = GameStore::create(store)?;
             println!("Created ECRA store at {}", store.path().display());
         }
-        Command::GenerateGame { store, code, seed } => {
+        Command::GenerateGame {
+            store,
+            code,
+            seed,
+            minimum_distance,
+        } => {
             let store = GameStore::open(store)?;
-            let game = generate_game(GameCode::new(code)?, seed);
+            let game = generate_game(
+                GameCode::new(code)?,
+                GenerateGameOptions {
+                    seed,
+                    minimum_stellium_distance: minimum_distance,
+                },
+            )?;
             store.create_game(&game)?;
             println!(
-                "Generated game {} with seed {} (status: {}, stellia: {})",
+                "Generated game {} with seed {} (status: {}, stellia: {}, minimum distance: {})",
                 game.code,
                 game.seed,
                 game.status,
-                game.stellia.len()
+                game.stellia.len(),
+                game.minimum_stellium_distance
             );
         }
+        Command::Report { report } => match report {
+            ReportCommand::Stellia { store, code, json } => {
+                let store = GameStore::open(store)?;
+                let game = store.load_game(&GameCode::new(code)?)?;
+                let entries = stellium_list(&game);
+
+                if let Some(path) = json {
+                    fs::write(&path, stellium_list_json(&entries)?)?;
+                    println!("Saved stellia report to {}", path.display());
+                } else {
+                    println!("STELLIUM   X   Y   Z  STARS");
+                    for entry in entries {
+                        println!(
+                            "{:8} {:3} {:3} {:3} {:6}",
+                            entry.id, entry.x, entry.y, entry.z, entry.stars
+                        );
+                    }
+                }
+            }
+        },
         Command::Manage { store } => {
             let store = GameStore::open(store)?;
             let info = store.info()?;

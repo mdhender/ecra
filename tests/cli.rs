@@ -13,10 +13,82 @@ fn help_lists_store_commands() {
     assert!(stdout.contains("version"));
     assert!(stdout.contains("new"));
     assert!(stdout.contains("generate-game"));
+    assert!(stdout.contains("report"));
     assert!(stdout.contains("manage"));
     assert!(stdout.contains("check-orders"));
     assert!(stdout.contains("import-orders"));
     assert!(stdout.contains("help"));
+}
+
+#[test]
+fn reports_stellia_to_stdout_and_deterministic_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let first_json = directory.path().join("stellia.json");
+    let second_json = directory.path().join("stellia-again.json");
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ecra()
+            .args([
+                "generate-game",
+                store.to_str().unwrap(),
+                "REPORT",
+                "--seed",
+                "42",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let text = ecra()
+        .args(["report", "stellia", store.to_str().unwrap(), "REPORT"])
+        .output()
+        .unwrap();
+    assert!(text.status.success());
+    let stdout = String::from_utf8(text.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(lines[0], "STELLIUM   X   Y   Z  STARS");
+    assert_eq!(lines.len(), 101);
+
+    for path in [&first_json, &second_json] {
+        let output = ecra()
+            .args([
+                "report",
+                "stellia",
+                store.to_str().unwrap(),
+                "REPORT",
+                "--json",
+                path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let first = std::fs::read_to_string(first_json).unwrap();
+    let second = std::fs::read_to_string(second_json).unwrap();
+    assert_eq!(first, second);
+    let entries: serde_json::Value = serde_json::from_str(&first).unwrap();
+    let entries = entries.as_array().unwrap();
+    assert_eq!(entries.len(), 100);
+    assert!(entries.iter().all(|entry| {
+        entry.get("id").is_some()
+            && entry.get("x").is_some()
+            && entry.get("y").is_some()
+            && entry.get("z").is_some()
+            && entry.get("stars").is_some()
+    }));
 }
 
 #[test]
@@ -57,7 +129,7 @@ fn creates_then_manages_a_store() {
         String::from_utf8_lossy(&managed.stderr)
     );
     let stdout = String::from_utf8(managed.stdout).unwrap();
-    assert!(stdout.contains("Format version: 1"));
+    assert!(stdout.contains("Format version: 2"));
     assert!(stdout.contains("Current turn: 1"));
 }
 
@@ -124,7 +196,27 @@ fn generates_multiple_seeded_games_and_rejects_duplicate_codes() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(&format!("game {code} with seed {seed}")));
         assert!(stdout.contains("status: setup, stellia: 100"));
+        assert!(stdout.contains("minimum distance: 3"));
     }
+
+    let custom_distance = ecra()
+        .args([
+            "generate-game",
+            path.to_str().unwrap(),
+            "GAMMA",
+            "--seed",
+            "30",
+            "--minimum-distance",
+            "5",
+        ])
+        .output()
+        .unwrap();
+    assert!(custom_distance.status.success());
+    assert!(
+        String::from_utf8(custom_distance.stdout)
+            .unwrap()
+            .contains("minimum distance: 5")
+    );
 
     let managed = ecra()
         .args(["manage", path.to_str().unwrap()])
@@ -133,7 +225,7 @@ fn generates_multiple_seeded_games_and_rejects_duplicate_codes() {
     assert!(
         String::from_utf8(managed.stdout)
             .unwrap()
-            .contains("Games: 2")
+            .contains("Games: 3")
     );
 
     let duplicate = ecra()

@@ -1,11 +1,16 @@
 use std::fmt;
 
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use thiserror::Error;
 
 pub const STELLIA_PER_GAME: usize = 100;
+pub const DEFAULT_MINIMUM_STELLIUM_DISTANCE: u8 = 3;
+pub const MINIMUM_COORDINATE: i8 = -15;
+pub const MAXIMUM_COORDINATE: i8 = 15;
 const STELLIUM_STREAM: u64 = 0x5354_454c_4c49_554d;
+const COORDINATE_STREAM: u64 = 0x434f_4f52_4449_4e41;
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GameCode(String);
@@ -85,12 +90,29 @@ impl StelliumId {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stellium {
     pub id: StelliumId,
+    pub coordinates: Coordinates,
     pub stars: Vec<Star>,
 }
 
 impl Stellium {
     pub fn star_count(&self) -> usize {
         self.stars.len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Coordinates {
+    pub x: i8,
+    pub y: i8,
+    pub z: i8,
+}
+
+impl Coordinates {
+    pub fn squared_distance(self, other: Self) -> u32 {
+        let dx = i32::from(self.x) - i32::from(other.x);
+        let dy = i32::from(self.y) - i32::from(other.y);
+        let dz = i32::from(self.z) - i32::from(other.z);
+        (dx * dx + dy * dy + dz * dz) as u32
     }
 }
 
@@ -116,29 +138,97 @@ pub struct Star {
 pub struct Game {
     pub code: GameCode,
     pub seed: u64,
+    pub minimum_stellium_distance: u8,
     pub status: GameStatus,
     pub stellia: Vec<Stellium>,
 }
 
-pub fn generate_game(code: GameCode, seed: Option<u64>) -> Game {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerateGameOptions {
+    pub seed: Option<u64>,
+    pub minimum_stellium_distance: u8,
+}
+
+impl Default for GenerateGameOptions {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            minimum_stellium_distance: DEFAULT_MINIMUM_STELLIUM_DISTANCE,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error(
+    "could not place {STELLIA_PER_GAME} stellia at least {minimum_distance} units apart within [{MINIMUM_COORDINATE}..{MAXIMUM_COORDINATE}]"
+)]
+pub struct StelliumPlacementError {
+    minimum_distance: u8,
+}
+
+pub fn generate_game(
+    code: GameCode,
+    options: GenerateGameOptions,
+) -> Result<Game, StelliumPlacementError> {
+    let GenerateGameOptions {
+        seed,
+        minimum_stellium_distance,
+    } = options;
     let seed = seed.unwrap_or_else(rand::random);
     let mut stellium_rng = ChaCha8Rng::seed_from_u64(stream_seed(seed, STELLIUM_STREAM));
-    let stellia = (1..=STELLIA_PER_GAME)
-        .map(|number| {
+    let coordinates = generate_coordinates(seed, minimum_stellium_distance)?;
+    let stellia = coordinates
+        .into_iter()
+        .enumerate()
+        .map(|(index, coordinates)| {
             let star_count = stellium_rng.random_range(1..=5);
             Stellium {
-                id: StelliumId::new(number as u32),
+                id: StelliumId::new(index as u32 + 1),
+                coordinates,
                 stars: (1..=star_count).map(|id| Star { id: StarId(id) }).collect(),
             }
         })
         .collect();
 
-    Game {
+    Ok(Game {
         code,
         seed,
+        minimum_stellium_distance,
         status: GameStatus::Setup,
         stellia,
+    })
+}
+
+fn generate_coordinates(
+    seed: u64,
+    minimum_distance: u8,
+) -> Result<Vec<Coordinates>, StelliumPlacementError> {
+    let mut candidates = (MINIMUM_COORDINATE..=MAXIMUM_COORDINATE)
+        .flat_map(|x| {
+            (MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).flat_map(move |y| {
+                (MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).map(move |z| Coordinates { x, y, z })
+            })
+        })
+        .filter(|coordinates| *coordinates != Coordinates { x: 0, y: 0, z: 0 })
+        .collect::<Vec<_>>();
+    let mut rng = ChaCha8Rng::seed_from_u64(stream_seed(seed, COORDINATE_STREAM));
+    candidates.shuffle(&mut rng);
+
+    let minimum_squared_distance = u32::from(minimum_distance).pow(2);
+    let mut selected = Vec::with_capacity(STELLIA_PER_GAME);
+    for candidate in candidates {
+        if selected
+            .iter()
+            .all(|existing| candidate.squared_distance(*existing) >= minimum_squared_distance)
+        {
+            selected.push(candidate);
+            if selected.len() == STELLIA_PER_GAME {
+                return Ok(selected);
+            }
+        }
     }
+
+    Err(StelliumPlacementError { minimum_distance })
 }
 
 // SplitMix64 gives each named stream a stable seed without sharing mutable PRNG state.
@@ -165,10 +255,18 @@ mod tests {
 
     #[test]
     fn generation_is_deterministic_for_a_seed() {
-        let first = generate_game(GameCode::new("FIRST").unwrap(), Some(42));
-        let second = generate_game(GameCode::new("SECOND").unwrap(), Some(42));
+        let options = GenerateGameOptions {
+            seed: Some(42),
+            ..GenerateGameOptions::default()
+        };
+        let first = generate_game(GameCode::new("FIRST").unwrap(), options).unwrap();
+        let second = generate_game(GameCode::new("SECOND").unwrap(), options).unwrap();
 
         assert_eq!(first.seed, 42);
+        assert_eq!(
+            first.minimum_stellium_distance,
+            DEFAULT_MINIMUM_STELLIUM_DISTANCE
+        );
         assert_eq!(first.status, GameStatus::Setup);
         assert_eq!(first.stellia, second.stellia);
         assert_eq!(first.stellia.len(), STELLIA_PER_GAME);
@@ -178,13 +276,72 @@ mod tests {
                 .iter()
                 .all(|s| (1..=5).contains(&s.star_count()))
         );
+        assert_valid_coordinates(&first, DEFAULT_MINIMUM_STELLIUM_DISTANCE);
     }
 
     #[test]
     fn different_seeds_generate_different_clusters() {
-        let first = generate_game(GameCode::new("FIRST").unwrap(), Some(1));
-        let second = generate_game(GameCode::new("SECOND").unwrap(), Some(2));
+        let first = generate_game(
+            GameCode::new("FIRST").unwrap(),
+            GenerateGameOptions {
+                seed: Some(1),
+                ..GenerateGameOptions::default()
+            },
+        )
+        .unwrap();
+        let second = generate_game(
+            GameCode::new("SECOND").unwrap(),
+            GenerateGameOptions {
+                seed: Some(2),
+                ..GenerateGameOptions::default()
+            },
+        )
+        .unwrap();
 
         assert_ne!(first.stellia, second.stellia);
+    }
+
+    #[test]
+    fn honors_a_custom_minimum_distance() {
+        let game = generate_game(
+            GameCode::new("SPARSE").unwrap(),
+            GenerateGameOptions {
+                seed: Some(42),
+                minimum_stellium_distance: 5,
+            },
+        )
+        .unwrap();
+
+        assert_valid_coordinates(&game, 5);
+    }
+
+    #[test]
+    fn rejects_a_minimum_distance_that_cannot_fit_the_cluster() {
+        let result = generate_game(
+            GameCode::new("IMPOSSIBLE").unwrap(),
+            GenerateGameOptions {
+                seed: Some(42),
+                minimum_stellium_distance: u8::MAX,
+            },
+        );
+
+        assert!(result.is_err());
+    }
+
+    fn assert_valid_coordinates(game: &Game, minimum_distance: u8) {
+        for (index, stellium) in game.stellia.iter().enumerate() {
+            let coordinates = stellium.coordinates;
+            assert!((MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.x));
+            assert!((MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.y));
+            assert!((MINIMUM_COORDINATE..=MAXIMUM_COORDINATE).contains(&coordinates.z));
+            assert_ne!(coordinates, Coordinates { x: 0, y: 0, z: 0 });
+
+            for other in &game.stellia[..index] {
+                assert!(
+                    coordinates.squared_distance(other.coordinates)
+                        >= u32::from(minimum_distance).pow(2)
+                );
+            }
+        }
     }
 }
