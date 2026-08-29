@@ -34,6 +34,7 @@ cargo build --release    # optimized binary at target/release/ecra
 ```
 ecra version                        Print the application version
 ecra new <store>                    Create a new game store
+ecra generate-game <store> <code>   Generate a game (`--seed <u64>` is optional)
 ecra manage <store>                 Open and inspect an existing game store
 ecra seed-accounts <store>          Seed an existing store with accounts for testing
 ecra check-orders <file>            Check an order file for syntax errors
@@ -43,6 +44,12 @@ ecra import-orders <store> <file>   Import and parse a raw order file
 `<store>` is a path to a [redb](https://github.com/cberner/redb) database file.
 `new` refuses to replace an existing store and will not create missing parent
 directories.
+
+`generate-game` adds a game to an existing store. A store can contain multiple games,
+each identified by a unique 1-16 character code beginning with `A-Z` and containing
+only `A-Z`, `0-9`, or `-`. Generation creates 100 stellia with one to five stars each
+and status `setup`. Supplying `--seed` makes the generated cluster reproducible; when
+omitted, the generated seed is recorded and printed so the game can still be replayed.
 
 `check-orders` needs no store: it reads a file, reports every independent syntax
 error, and exits non-zero if any were found. `import-orders` persists the raw
@@ -60,6 +67,7 @@ Every command below is reproducible from a clean checkout:
 
 ```bash
 cargo run -- new /tmp/demo.redb
+cargo run -- generate-game /tmp/demo.redb ECRA-01 --seed 42
 cargo run -- seed-accounts /tmp/demo.redb
 cargo run -- check-orders tests/fixtures/orders/valid-complete.orders
 cargo run -- import-orders /tmp/demo.redb tests/fixtures/orders/valid-complete.orders
@@ -70,6 +78,7 @@ Which produces:
 
 ```
 Created ECRA store at /tmp/demo.redb
+Generated game ECRA-01 with seed 42 (status: setup, stellia: 100)
 Created 13 test accounts in /tmp/demo.redb
 No syntax errors found in tests/fixtures/orders/valid-complete.orders
 Imported tests/fixtures/orders/valid-complete.orders as order import 1
@@ -77,6 +86,7 @@ Parsed 2 player orders successfully
 Store: /tmp/demo.redb
 Format version: 1
 Current turn: 1
+Games: 1
 ```
 
 Reopening the store — as `manage` does above — reads the persisted state back, so the
@@ -151,6 +161,7 @@ implementation plan.
 | --- | --- |
 | `src/orders.rs` | Tokenizing and parsing order-file text into domain `Order` values |
 | `src/accounts.rs` | Account identity and roles |
+| `src/game.rs` | Game identity and deterministic star-cluster generation |
 | `src/storage.rs` | `GameStore`, the domain-oriented `redb` API |
 | `src/app.rs` | Lifecycle orchestration across parsing and storage |
 | `src/main.rs` | CLI argument parsing and command dispatch |

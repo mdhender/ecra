@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ecra::app::import_order_file;
+use ecra::game::{GameCode, generate_game};
 use ecra::orders::check_order_file_syntax;
 use ecra::storage::GameStore;
 
@@ -22,6 +23,16 @@ enum Command {
     New {
         /// Path of the store to create
         store: PathBuf,
+    },
+    /// Generate a game in an existing store
+    GenerateGame {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Base seed for deterministic generation
+        #[arg(long)]
+        seed: Option<u64>,
     },
     /// Open and inspect an existing game store
     Manage {
@@ -63,12 +74,25 @@ fn run() -> Result<(), Box<dyn Error>> {
             let store = GameStore::create(store)?;
             println!("Created ECRA store at {}", store.path().display());
         }
+        Command::GenerateGame { store, code, seed } => {
+            let store = GameStore::open(store)?;
+            let game = generate_game(GameCode::new(code)?, seed);
+            store.create_game(&game)?;
+            println!(
+                "Generated game {} with seed {} (status: {}, stellia: {})",
+                game.code,
+                game.seed,
+                game.status,
+                game.stellia.len()
+            );
+        }
         Command::Manage { store } => {
             let store = GameStore::open(store)?;
             let info = store.info()?;
             println!("Store: {}", store.path().display());
             println!("Format version: {}", info.format_version);
             println!("Current turn: {}", info.current_turn);
+            println!("Games: {}", store.game_count()?);
         }
         Command::SeedAccounts { store } => {
             let store = GameStore::open(store)?;

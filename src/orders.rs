@@ -1,20 +1,7 @@
 use std::error::Error;
 use std::fmt;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct GameCode(String);
-
-impl GameCode {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for GameCode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
+use crate::game::GameCode;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Turn(u32);
@@ -488,7 +475,10 @@ impl<'a, 'source> Parser<'a, 'source> {
 
     fn parse_header(&mut self) -> Result<OrderFileHeader, ParseError> {
         self.expect_word("game")?;
-        let game = GameCode(self.take_word("game code")?.to_owned());
+        let game_text = self.take_word("game code")?;
+        let game = GameCode::new(game_text.to_owned()).map_err(|error| {
+            self.error_at_current_or_previous(Some(game_text), error.to_string())
+        })?;
         self.expect_word("turn")?;
         let turn_text = self.take_word("turn number")?;
         let turn = turn_text.parse::<u32>().map_err(|_| {

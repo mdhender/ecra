@@ -12,6 +12,7 @@ fn help_lists_store_commands() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("version"));
     assert!(stdout.contains("new"));
+    assert!(stdout.contains("generate-game"));
     assert!(stdout.contains("manage"));
     assert!(stdout.contains("check-orders"));
     assert!(stdout.contains("import-orders"));
@@ -89,6 +90,91 @@ fn new_refuses_to_replace_an_existing_store() {
             .status()
             .unwrap()
             .success()
+    );
+}
+
+#[test]
+fn generates_multiple_seeded_games_and_rejects_duplicate_codes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("games.redb");
+    assert!(
+        ecra()
+            .args(["new", path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    for (code, seed) in [("ALPHA", "10"), ("BETA-2", "20")] {
+        let output = ecra()
+            .args([
+                "generate-game",
+                path.to_str().unwrap(),
+                code,
+                "--seed",
+                seed,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(&format!("game {code} with seed {seed}")));
+        assert!(stdout.contains("status: setup, stellia: 100"));
+    }
+
+    let managed = ecra()
+        .args(["manage", path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(managed.stdout)
+            .unwrap()
+            .contains("Games: 2")
+    );
+
+    let duplicate = ecra()
+        .args([
+            "generate-game",
+            path.to_str().unwrap(),
+            "ALPHA",
+            "--seed",
+            "99",
+        ])
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(
+        String::from_utf8(duplicate.stderr)
+            .unwrap()
+            .contains("already exists")
+    );
+}
+
+#[test]
+fn generate_game_rejects_a_non_uppercase_code() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("games.redb");
+    assert!(
+        ecra()
+            .args(["new", path.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let output = ecra()
+        .args(["generate-game", path.to_str().unwrap(), "lowercase"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("invalid game code")
     );
 }
 

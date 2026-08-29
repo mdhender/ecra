@@ -2,15 +2,22 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use thiserror::Error;
 
 use crate::accounts::{Account, AccountRole};
+use crate::game::{
+    Game, GameCode, GameStatus, STELLIA_PER_GAME, Star, StarId, Stellium, StelliumId,
+};
 
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadata");
 const ACCOUNT_EMAILS: TableDefinition<u32, &str> = TableDefinition::new("account_emails");
 const ACCOUNT_TOKENS: TableDefinition<u32, &str> = TableDefinition::new("account_tokens");
 const ACCOUNT_ROLES: TableDefinition<u32, &str> = TableDefinition::new("account_roles");
+const GAME_SEEDS: TableDefinition<&str, u64> = TableDefinition::new("game_seeds");
+const GAME_STATUSES: TableDefinition<&str, &str> = TableDefinition::new("game_statuses");
+const STELLIUM_STAR_COUNTS: TableDefinition<&str, u8> =
+    TableDefinition::new("stellium_star_counts");
 const ORDER_IMPORT_FILENAMES: TableDefinition<u64, &str> =
     TableDefinition::new("order_import_filenames");
 const ORDER_IMPORT_SOURCES: TableDefinition<u64, &str> =
@@ -79,6 +86,10 @@ pub enum StoreError {
     InvalidStore { path: PathBuf, reason: String },
     #[error("test account {number:04} conflicts with an existing account")]
     AccountConflict { number: u32 },
+    #[error("game `{0}` already exists")]
+    GameAlreadyExists(String),
+    #[error("game `{0}` does not exist")]
+    GameNotFound(String),
     #[error("order import {0} does not exist")]
     OrderImportNotFound(u64),
     #[error("order import {0} already has a different parse result")]
@@ -135,6 +146,7 @@ impl GameStore {
                     .insert(NEXT_ORDER_IMPORT_KEY, "1")
                     .map_err(|source| database_error(&path, source))?;
             }
+            database_tables(&write, &path)?;
             write
                 .commit()
                 .map_err(|source| database_error(&path, source))?;
@@ -196,6 +208,122 @@ impl GameStore {
             format_version,
             current_turn,
         })
+    }
+
+    /// Atomically adds a generated game. Game codes are unique within the store.
+    pub fn create_game(&self, game: &Game) -> Result<(), StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        let code = game.code.as_str();
+
+        {
+            let mut seeds = write
+                .open_table(GAME_SEEDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            if seeds
+                .get(code)
+                .map_err(|source| database_error(&self.path, source))?
+                .is_some()
+            {
+                return Err(StoreError::GameAlreadyExists(code.to_owned()));
+            }
+            seeds
+                .insert(code, game.seed)
+                .map_err(|source| database_error(&self.path, source))?;
+        }
+        write
+            .open_table(GAME_STATUSES)
+            .map_err(|source| database_error(&self.path, source))?
+            .insert(code, game.status.as_str())
+            .map_err(|source| database_error(&self.path, source))?;
+        {
+            let mut star_counts = write
+                .open_table(STELLIUM_STAR_COUNTS)
+                .map_err(|source| database_error(&self.path, source))?;
+            for stellium in &game.stellia {
+                let key = stellium_key(code, stellium.id);
+                star_counts
+                    .insert(key.as_str(), stellium.star_count() as u8)
+                    .map_err(|source| database_error(&self.path, source))?;
+            }
+        }
+
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))
+    }
+
+    pub fn load_game(&self, code: &GameCode) -> Result<Game, StoreError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|source| database_error(&self.path, source))?;
+        let seeds = read
+            .open_table(GAME_SEEDS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let statuses = read
+            .open_table(GAME_STATUSES)
+            .map_err(|source| database_error(&self.path, source))?;
+        let star_counts = read
+            .open_table(STELLIUM_STAR_COUNTS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let missing = || StoreError::GameNotFound(code.to_string());
+
+        let seed = seeds
+            .get(code.as_str())
+            .map_err(|source| database_error(&self.path, source))?
+            .map(|value| value.value())
+            .ok_or_else(missing)?;
+        let status_text = statuses
+            .get(code.as_str())
+            .map_err(|source| database_error(&self.path, source))?
+            .map(|value| value.value().to_owned())
+            .ok_or_else(|| invalid_game(&self.path, code, "status is missing"))?;
+        let status = GameStatus::from_str(&status_text)
+            .ok_or_else(|| invalid_game(&self.path, code, "status is invalid"))?;
+        let mut stellia = Vec::with_capacity(STELLIA_PER_GAME);
+        for number in 1..=STELLIA_PER_GAME as u32 {
+            let id = StelliumId::new(number);
+            let key = stellium_key(code.as_str(), id);
+            let star_count = star_counts
+                .get(key.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value())
+                .ok_or_else(|| invalid_game(&self.path, code, "stellium data is incomplete"))?;
+            if !(1..=5).contains(&star_count) {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "stellium star count is invalid",
+                ));
+            }
+            let stars = (1..=star_count)
+                .map(|number| Star {
+                    id: StarId::new(number),
+                })
+                .collect();
+            stellia.push(Stellium { id, stars });
+        }
+
+        Ok(Game {
+            code: code.clone(),
+            seed,
+            status,
+            stellia,
+        })
+    }
+
+    pub fn game_count(&self) -> Result<u64, StoreError> {
+        let read = self
+            .database
+            .begin_read()
+            .map_err(|source| database_error(&self.path, source))?;
+        read.open_table(GAME_SEEDS)
+            .map_err(|source| database_error(&self.path, source))?
+            .len()
+            .map_err(|source| database_error(&self.path, source))
     }
 
     /// Adds the fixed testing accounts, leaving an already-matching seed unchanged.
@@ -451,6 +579,19 @@ impl GameStore {
     }
 }
 
+fn database_tables(write: &redb::WriteTransaction, path: &Path) -> Result<(), StoreError> {
+    write
+        .open_table(GAME_SEEDS)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(GAME_STATUSES)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(STELLIUM_STAR_COUNTS)
+        .map_err(|source| database_error(path, source))?;
+    Ok(())
+}
+
 fn validate_new_store_path(path: &Path) -> Result<(), StoreError> {
     if path.file_name().is_none() {
         return Err(StoreError::InvalidPath {
@@ -517,6 +658,17 @@ fn database_error(path: &Path, source: impl Into<redb::Error>) -> StoreError {
     StoreError::Database {
         path: path.to_owned(),
         source: source.into(),
+    }
+}
+
+fn stellium_key(code: &str, id: StelliumId) -> String {
+    format!("{code}:{:03}", id.number())
+}
+
+fn invalid_game(path: &Path, code: &GameCode, reason: &str) -> StoreError {
+    StoreError::InvalidStore {
+        path: path.to_owned(),
+        reason: format!("game `{code}` {reason}"),
     }
 }
 
@@ -604,5 +756,38 @@ mod tests {
             let expected_role = if number == 1 { "administrator" } else { "user" };
             assert_eq!(roles.get(number).unwrap().unwrap().value(), expected_role);
         }
+    }
+
+    #[test]
+    fn stores_multiple_games_and_reconstructs_their_clusters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        let store = GameStore::create(&path).unwrap();
+        let first = crate::game::generate_game(GameCode::new("FIRST").unwrap(), Some(10));
+        let second = crate::game::generate_game(GameCode::new("SECOND").unwrap(), Some(20));
+
+        store.create_game(&first).unwrap();
+        store.create_game(&second).unwrap();
+        assert_eq!(store.game_count().unwrap(), 2);
+        drop(store);
+
+        let reopened = GameStore::open(&path).unwrap();
+        assert_eq!(reopened.load_game(&first.code).unwrap(), first);
+        assert_eq!(reopened.load_game(&second.code).unwrap(), second);
+    }
+
+    #[test]
+    fn rejects_a_duplicate_game_code_without_changing_the_game() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GameStore::create(directory.path().join("game.redb")).unwrap();
+        let first = crate::game::generate_game(GameCode::new("SAME").unwrap(), Some(10));
+        let duplicate = crate::game::generate_game(GameCode::new("SAME").unwrap(), Some(20));
+
+        store.create_game(&first).unwrap();
+        assert!(matches!(
+            store.create_game(&duplicate),
+            Err(StoreError::GameAlreadyExists(code)) if code == "SAME"
+        ));
+        assert_eq!(store.load_game(&first.code).unwrap(), first);
     }
 }
