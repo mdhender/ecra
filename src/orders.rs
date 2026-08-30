@@ -2,6 +2,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::game::GameCode;
+pub use crate::game::{FactionId, PlayerId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Turn(u32);
@@ -24,24 +25,6 @@ pub struct Email(String);
 impl Email {
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PlayerId(u64);
-
-impl PlayerId {
-    pub fn number(self) -> u64 {
-        self.0
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FactionId(u64);
-
-impl FactionId {
-    pub fn number(self) -> u64 {
-        self.0
     }
 }
 
@@ -502,11 +485,11 @@ impl<'a, 'source> Parser<'a, 'source> {
             "email" => OrderFileOwner::Email(Email(self.take_word("email")?.to_owned())),
             "player" => {
                 let text = self.take_word("player ID")?;
-                OrderFileOwner::Player(PlayerId(self.parse_id(text, "player ID")?))
+                OrderFileOwner::Player(PlayerId::new(self.parse_id(text, "player ID")?))
             }
             "faction" => {
                 let text = self.take_word("faction ID")?;
-                OrderFileOwner::Faction(FactionId(self.parse_id(text, "faction ID")?))
+                OrderFileOwner::Faction(FactionId::new(self.parse_id(text, "faction ID")?))
             }
             other => {
                 return Err(self.error_at_current_or_previous(
@@ -793,8 +776,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(player.owner, OrderFileOwner::Player(PlayerId(42)));
-        assert_eq!(faction.owner, OrderFileOwner::Faction(FactionId(91)));
+        assert_eq!(player.owner, OrderFileOwner::Player(PlayerId::new(42)));
+        assert_eq!(faction.owner, OrderFileOwner::Faction(FactionId::new(91)));
     }
 
     #[test]

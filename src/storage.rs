@@ -6,9 +6,11 @@ use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, Tab
 use thiserror::Error;
 
 use crate::accounts::{Account, AccountRole};
+use crate::agents::{available_agent, uncontrolled_agent};
 use crate::game::{
-    Coordinates, Game, GameCode, GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE, Player,
-    STELLIA_PER_GAME, Star, StarId, Stellium, StelliumId,
+    Agent, AgentId, AgentKind, Coordinates, Faction, FactionController, FactionId, Game, GameCode,
+    GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE, Player, PlayerId, STELLIA_PER_GAME, Star,
+    StarId, Stellium, StelliumId, UNCONTROLLED_AGENT_ID,
 };
 
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadata");
@@ -19,7 +21,12 @@ const GAME_SEEDS: TableDefinition<&str, u64> = TableDefinition::new("game_seeds"
 const GAME_STATUSES: TableDefinition<&str, &str> = TableDefinition::new("game_statuses");
 const GAME_MINIMUM_STELLIUM_DISTANCES: TableDefinition<&str, u8> =
     TableDefinition::new("game_minimum_stellium_distances");
-const GAME_PLAYERS: TableDefinition<&str, u8> = TableDefinition::new("game_players");
+const GAME_PLAYERS: TableDefinition<&str, u64> = TableDefinition::new("game_players");
+const GAME_AGENTS: TableDefinition<&str, &str> = TableDefinition::new("game_agents");
+const GAME_FACTION_CONTROLLER_KINDS: TableDefinition<&str, &str> =
+    TableDefinition::new("game_faction_controller_kinds");
+const GAME_FACTION_CONTROLLER_IDS: TableDefinition<&str, u64> =
+    TableDefinition::new("game_faction_controller_ids");
 const STELLIUM_STAR_COUNTS: TableDefinition<&str, u8> =
     TableDefinition::new("stellium_star_counts");
 const STELLIUM_X_COORDINATES: TableDefinition<&str, i8> =
@@ -39,8 +46,8 @@ const ORDER_IMPORT_DIAGNOSTICS: TableDefinition<u64, &str> =
 const APPLICATION_KEY: &str = "application";
 const APPLICATION_VALUE: &str = "ecra";
 const FORMAT_VERSION_KEY: &str = "format_version";
-const FORMAT_VERSION_VALUE: &str = "3";
-const SUPPORTED_FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION_VALUE: &str = "4";
+const SUPPORTED_FORMAT_VERSION: u32 = 4;
 const CURRENT_TURN_KEY: &str = "current_turn";
 const INITIAL_TURN: &str = "1";
 const NEXT_ORDER_IMPORT_KEY: &str = "next_order_import";
@@ -100,6 +107,8 @@ pub enum StoreError {
     GameAlreadyExists(String),
     #[error("game `{0}` does not exist")]
     GameNotFound(String),
+    #[error("agent {0} is not implemented by this engine")]
+    AgentNotAvailable(u64),
     #[error("order import {0} does not exist")]
     OrderImportNotFound(u64),
     #[error("order import {0} already has a different parse result")]
@@ -254,6 +263,16 @@ impl GameStore {
             .insert(code, game.minimum_stellium_distance)
             .map_err(|source| database_error(&self.path, source))?;
         {
+            let mut agents = write
+                .open_table(GAME_AGENTS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let uncontrolled = uncontrolled_agent();
+            let uncontrolled_key = agent_key(code, uncontrolled.id);
+            agents
+                .insert(uncontrolled_key.as_str(), uncontrolled.kind.as_str())
+                .map_err(|source| database_error(&self.path, source))?;
+        }
+        {
             let mut star_counts = write
                 .open_table(STELLIUM_STAR_COUNTS)
                 .map_err(|source| database_error(&self.path, source))?;
@@ -304,6 +323,15 @@ impl GameStore {
             .map_err(|source| database_error(&self.path, source))?;
         let game_players = read
             .open_table(GAME_PLAYERS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let game_agents = read
+            .open_table(GAME_AGENTS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let faction_controller_kinds = read
+            .open_table(GAME_FACTION_CONTROLLER_KINDS)
+            .map_err(|source| database_error(&self.path, source))?;
+        let faction_controller_ids = read
+            .open_table(GAME_FACTION_CONTROLLER_IDS)
             .map_err(|source| database_error(&self.path, source))?;
         let star_counts = read
             .open_table(STELLIUM_STAR_COUNTS)
@@ -405,14 +433,96 @@ impl GameStore {
             .iter()
             .map_err(|source| database_error(&self.path, source))?
         {
-            let (key, _) = entry.map_err(|source| database_error(&self.path, source))?;
+            let (key, id) = entry.map_err(|source| database_error(&self.path, source))?;
             if let Some(email) = key.value().strip_prefix(&player_prefix) {
                 players.push(Player {
+                    id: PlayerId::new(id.value()),
                     email: email.to_owned(),
                 });
             }
         }
-        players.sort();
+        players.sort_by(|left, right| left.email.cmp(&right.email));
+
+        let mut agents = Vec::new();
+        for entry in game_agents
+            .iter()
+            .map_err(|source| database_error(&self.path, source))?
+        {
+            let (key, kind) = entry.map_err(|source| database_error(&self.path, source))?;
+            let Some(id) = scoped_id(key.value(), code.as_str()) else {
+                continue;
+            };
+            let kind = AgentKind::from_str(kind.value())
+                .ok_or_else(|| invalid_game(&self.path, code, "has an invalid agent kind"))?;
+            let agent = Agent {
+                id: AgentId::new(id),
+                kind,
+            };
+            if available_agent(agent.id) != Some(agent) {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "references an agent not implemented by this engine",
+                ));
+            }
+            agents.push(agent);
+        }
+        agents.sort_by_key(|agent| agent.id);
+        if !agents
+            .iter()
+            .any(|agent| agent.id == UNCONTROLLED_AGENT_ID && agent.kind == AgentKind::Uncontrolled)
+        {
+            return Err(invalid_game(
+                &self.path,
+                code,
+                "is missing its uncontrolled agent",
+            ));
+        }
+
+        let mut factions = Vec::new();
+        for entry in faction_controller_kinds
+            .iter()
+            .map_err(|source| database_error(&self.path, source))?
+        {
+            let (key, kind) = entry.map_err(|source| database_error(&self.path, source))?;
+            let Some(id) = scoped_id(key.value(), code.as_str()) else {
+                continue;
+            };
+            let controller_id = faction_controller_ids
+                .get(key.value())
+                .map_err(|source| database_error(&self.path, source))?
+                .map(|value| value.value())
+                .ok_or_else(|| {
+                    invalid_game(&self.path, code, "has incomplete faction controller data")
+                })?;
+            let controller = match kind.value() {
+                "player" => FactionController::Player(PlayerId::new(controller_id)),
+                "agent" => FactionController::Agent(AgentId::new(controller_id)),
+                _ => {
+                    return Err(invalid_game(
+                        &self.path,
+                        code,
+                        "has an invalid faction controller kind",
+                    ));
+                }
+            };
+            let controller_exists = match controller {
+                FactionController::Player(id) => players.iter().any(|player| player.id == id),
+                FactionController::Agent(id) => agents.iter().any(|agent| agent.id == id),
+            };
+            if !controller_exists {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "has a faction with a missing controller",
+                ));
+            }
+            factions.push(Faction {
+                id: FactionId::new(id),
+                controller,
+            });
+        }
+        factions.sort_by_key(|faction| faction.id);
 
         Ok(Game {
             code: code.clone(),
@@ -421,11 +531,13 @@ impl GameStore {
             status,
             stellia,
             players,
+            agents,
+            factions,
         })
     }
 
     /// Atomically assigns players to an existing game, ignoring existing assignments.
-    pub fn add_players(&self, code: &GameCode, players: &[Player]) -> Result<usize, StoreError> {
+    pub fn add_players(&self, code: &GameCode, emails: &[String]) -> Result<usize, StoreError> {
         let write = self
             .database
             .begin_write()
@@ -448,20 +560,149 @@ impl GameStore {
             let mut assignments = write
                 .open_table(GAME_PLAYERS)
                 .map_err(|source| database_error(&self.path, source))?;
-            for player in players {
-                let key = player_key(code.as_str(), &player.email);
+            let player_prefix = format!("{}:", code.as_str());
+            let mut highest_id = 0;
+            for entry in assignments
+                .iter()
+                .map_err(|source| database_error(&self.path, source))?
+            {
+                let (key, id) = entry.map_err(|source| database_error(&self.path, source))?;
+                if key.value().starts_with(&player_prefix) {
+                    highest_id = highest_id.max(id.value());
+                }
+            }
+            let mut next_id = highest_id + 1;
+            for email in emails {
+                let key = player_key(code.as_str(), email);
                 if assignments
                     .get(key.as_str())
                     .map_err(|source| database_error(&self.path, source))?
                     .is_none()
                 {
                     assignments
-                        .insert(key.as_str(), 1)
+                        .insert(key.as_str(), next_id)
+                        .map_err(|source| database_error(&self.path, source))?;
+                    created += 1;
+                    next_id += 1;
+                }
+            }
+        }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(created)
+    }
+
+    /// Adds factions to a game and immediately assigns them to its uncontrolled agent.
+    pub fn add_factions(
+        &self,
+        code: &GameCode,
+        faction_ids: &[FactionId],
+    ) -> Result<usize, StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        {
+            let games = write
+                .open_table(GAME_SEEDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            if games
+                .get(code.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::GameNotFound(code.to_string()));
+            }
+        }
+        {
+            let agents = write
+                .open_table(GAME_AGENTS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let key = agent_key(code.as_str(), UNCONTROLLED_AGENT_ID);
+            if agents
+                .get(key.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "is missing its uncontrolled agent",
+                ));
+            }
+        }
+
+        let mut created = 0;
+        {
+            let mut controller_kinds = write
+                .open_table(GAME_FACTION_CONTROLLER_KINDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let mut controller_ids = write
+                .open_table(GAME_FACTION_CONTROLLER_IDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            for faction_id in faction_ids {
+                let key = faction_key(code.as_str(), *faction_id);
+                if controller_kinds
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .is_none()
+                {
+                    controller_kinds
+                        .insert(key.as_str(), "agent")
+                        .map_err(|source| database_error(&self.path, source))?;
+                    controller_ids
+                        .insert(key.as_str(), UNCONTROLLED_AGENT_ID.number())
                         .map_err(|source| database_error(&self.path, source))?;
                     created += 1;
                 }
             }
         }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(created)
+    }
+
+    /// Assigns an agent implemented by this engine to an existing game.
+    pub fn assign_agent(&self, code: &GameCode, agent_id: AgentId) -> Result<bool, StoreError> {
+        let agent = available_agent(agent_id)
+            .ok_or_else(|| StoreError::AgentNotAvailable(agent_id.number()))?;
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        {
+            let games = write
+                .open_table(GAME_SEEDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            if games
+                .get(code.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::GameNotFound(code.to_string()));
+            }
+        }
+
+        let created = {
+            let mut assignments = write
+                .open_table(GAME_AGENTS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let key = agent_key(code.as_str(), agent.id);
+            if assignments
+                .get(key.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_some()
+            {
+                false
+            } else {
+                assignments
+                    .insert(key.as_str(), agent.kind.as_str())
+                    .map_err(|source| database_error(&self.path, source))?;
+                true
+            }
+        };
         write
             .commit()
             .map_err(|source| database_error(&self.path, source))?;
@@ -746,6 +987,15 @@ fn database_tables(write: &redb::WriteTransaction, path: &Path) -> Result<(), St
         .open_table(GAME_PLAYERS)
         .map_err(|source| database_error(path, source))?;
     write
+        .open_table(GAME_AGENTS)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(GAME_FACTION_CONTROLLER_KINDS)
+        .map_err(|source| database_error(path, source))?;
+    write
+        .open_table(GAME_FACTION_CONTROLLER_IDS)
+        .map_err(|source| database_error(path, source))?;
+    write
         .open_table(STELLIUM_STAR_COUNTS)
         .map_err(|source| database_error(path, source))?;
     write
@@ -837,6 +1087,18 @@ fn player_key(code: &str, email: &str) -> String {
     format!("{code}:{email}")
 }
 
+fn agent_key(code: &str, id: AgentId) -> String {
+    format!("{code}:{}", id.number())
+}
+
+fn faction_key(code: &str, id: FactionId) -> String {
+    format!("{code}:{}", id.number())
+}
+
+fn scoped_id(key: &str, code: &str) -> Option<u64> {
+    key.strip_prefix(code)?.strip_prefix(':')?.parse().ok()
+}
+
 fn invalid_game(path: &Path, code: &GameCode, reason: &str) -> StoreError {
     StoreError::InvalidStore {
         path: path.to_owned(),
@@ -858,7 +1120,7 @@ mod tests {
         assert_eq!(
             store.info().unwrap(),
             StoreInfo {
-                format_version: 3,
+                format_version: 4,
                 current_turn: 1
             }
         );
@@ -868,7 +1130,7 @@ mod tests {
         assert_eq!(
             reopened.info().unwrap(),
             StoreInfo {
-                format_version: 3,
+                format_version: 4,
                 current_turn: 1
             }
         );
@@ -1002,20 +1264,14 @@ mod tests {
         )
         .unwrap();
         store.create_game(&game).unwrap();
-        let players = vec![
-            Player {
-                email: "zoe@example.com".to_owned(),
-            },
-            Player {
-                email: "amy@example.com".to_owned(),
-            },
-            Player {
-                email: "zoe@example.com".to_owned(),
-            },
+        let emails = vec![
+            "zoe@example.com".to_owned(),
+            "amy@example.com".to_owned(),
+            "zoe@example.com".to_owned(),
         ];
 
-        assert_eq!(store.add_players(&game.code, &players).unwrap(), 2);
-        assert_eq!(store.add_players(&game.code, &players).unwrap(), 0);
+        assert_eq!(store.add_players(&game.code, &emails).unwrap(), 2);
+        assert_eq!(store.add_players(&game.code, &emails).unwrap(), 0);
         drop(store);
 
         let reopened = GameStore::open(path).unwrap();
@@ -1023,9 +1279,11 @@ mod tests {
             reopened.load_game(&game.code).unwrap().players,
             vec![
                 Player {
+                    id: PlayerId::new(2),
                     email: "amy@example.com".to_owned()
                 },
                 Player {
+                    id: PlayerId::new(1),
                     email: "zoe@example.com".to_owned()
                 }
             ]
@@ -1039,12 +1297,73 @@ mod tests {
         let code = GameCode::new("MISSING").unwrap();
 
         assert!(matches!(
-            store.add_players(
-                &code,
-                &[Player {
-                    email: "player@example.com".to_owned()
-                }]
-            ),
+            store.add_players(&code, &["player@example.com".to_owned()]),
+            Err(StoreError::GameNotFound(found)) if found == "MISSING"
+        ));
+    }
+
+    #[test]
+    fn adds_factions_idempotently_under_the_uncontrolled_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        let store = GameStore::create(&path).unwrap();
+        let mut game = crate::game::generate_game(
+            GameCode::new("FACTIONS").unwrap(),
+            crate::game::GenerateGameOptions::default(),
+        )
+        .unwrap();
+        // The store owns this invariant even if a caller omits the placeholder.
+        game.agents.clear();
+        store.create_game(&game).unwrap();
+        assert!(
+            !store
+                .assign_agent(&game.code, UNCONTROLLED_AGENT_ID)
+                .unwrap()
+        );
+        assert!(matches!(
+            store.assign_agent(&game.code, AgentId::new(999)),
+            Err(StoreError::AgentNotAvailable(999))
+        ));
+        let faction_ids = [FactionId::new(7), FactionId::new(2), FactionId::new(7)];
+
+        assert_eq!(store.add_factions(&game.code, &faction_ids).unwrap(), 2);
+        assert_eq!(store.add_factions(&game.code, &faction_ids).unwrap(), 0);
+        drop(store);
+
+        let loaded = GameStore::open(path)
+            .unwrap()
+            .load_game(&game.code)
+            .unwrap();
+        assert_eq!(
+            loaded.agents,
+            vec![Agent {
+                id: UNCONTROLLED_AGENT_ID,
+                kind: AgentKind::Uncontrolled,
+            }]
+        );
+        assert_eq!(
+            loaded.factions,
+            vec![
+                Faction {
+                    id: FactionId::new(2),
+                    controller: FactionController::Agent(UNCONTROLLED_AGENT_ID),
+                },
+                Faction {
+                    id: FactionId::new(7),
+                    controller: FactionController::Agent(UNCONTROLLED_AGENT_ID),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_factions_to_a_missing_game_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GameStore::create(directory.path().join("game.redb")).unwrap();
+        let code = GameCode::new("MISSING").unwrap();
+
+        assert!(matches!(
+            store.add_factions(&code, &[FactionId::new(1)]),
             Err(StoreError::GameNotFound(found)) if found == "MISSING"
         ));
     }

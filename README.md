@@ -38,6 +38,9 @@ ecra version                        Print the application version
 ecra new <store>                    Create a new game store
 ecra generate-game <store> <code>   Generate a game (`--seed` and `--minimum-distance` are optional)
 ecra add-players <store> <code> <email>...  Assign players to a game idempotently
+ecra report available-agents          List agents implemented by the engine (`--json <file>` supported)
+ecra report game-agents <store> <code>  List agents assigned to a game (`--json <file>` supported)
+ecra report agent-factions <store> <code>  List assigned agents and controlled factions (`--json <file>` supported)
 ecra report stellia <store> <code>  List stellia (`--json <file>` saves deterministic JSON)
 ecra report players <store> <code>  List assigned players (`--json <file>` saves deterministic JSON)
 ecra manage <store>                 Open and inspect an existing game store
@@ -66,6 +69,16 @@ as pretty-printed JSON with a trailing newline, suitable for golden test files.
 idempotent: duplicate addresses in one command or a later command do not change the
 game. `report players` lists assigned addresses in email order and supports the same
 `--json <file>` behavior as the stellia report.
+
+The engine owns the catalog of implemented agents, each with a stable ID and
+identifier. `report available-agents` reads that catalog without opening a store.
+The store persists only assignments of those agents to games; unknown agent IDs are
+rejected when assigning or loading a game. Every game is automatically assigned the
+placeholder `Uncontrolled` agent. Factions added through `GameStore::add_factions`
+are immediately assigned to it, so a stored faction can never be controller-less.
+`report game-agents` lists a game's assignments, while `report agent-factions` adds
+the sorted faction IDs controlled by each agent. Player-controlled assignment and
+other agent behavior are intentionally deferred.
 
 `check-orders` needs no store: it reads a file, reports every independent syntax
 error, and exits non-zero if any were found. `import-orders` persists the raw
@@ -105,7 +118,7 @@ No syntax errors found in tests/fixtures/orders/valid-complete.orders
 Imported tests/fixtures/orders/valid-complete.orders as order import 1
 Parsed 2 player orders successfully
 Store: /tmp/demo.redb
-Format version: 3
+Format version: 4
 Current turn: 1
 Games: 1
 ```
@@ -182,6 +195,7 @@ implementation plan.
 | --- | --- |
 | `src/orders.rs` | Tokenizing and parsing order-file text into domain `Order` values |
 | `src/accounts.rs` | Account identity and roles |
+| `src/agents.rs` | Engine-owned registry of implemented agents |
 | `src/game.rs` | Game identity and deterministic star-cluster generation |
 | `src/storage.rs` | `GameStore`, the domain-oriented `redb` API |
 | `src/app.rs` | Lifecycle orchestration across parsing and storage |

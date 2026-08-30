@@ -1,6 +1,22 @@
 use serde::Serialize;
 
-use crate::game::Game;
+use crate::agents::available_agents;
+use crate::game::{Agent, FactionController, Game};
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AgentListEntry {
+    pub id: u64,
+    pub identifier: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct AgentFactionsListEntry {
+    pub id: u64,
+    pub identifier: String,
+    pub name: String,
+    pub factions: Vec<u64>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct PlayerListEntry {
@@ -14,6 +30,63 @@ pub struct StelliumListEntry {
     pub y: i8,
     pub z: i8,
     pub stars: u8,
+}
+
+pub fn available_agent_list() -> Vec<AgentListEntry> {
+    agent_list(available_agents())
+}
+
+pub fn game_agent_list(game: &Game) -> Vec<AgentListEntry> {
+    agent_list(&game.agents)
+}
+
+pub fn agent_factions_list(game: &Game) -> Vec<AgentFactionsListEntry> {
+    let mut entries = game
+        .agents
+        .iter()
+        .map(|agent| {
+            let mut factions = game
+                .factions
+                .iter()
+                .filter_map(|faction| match faction.controller {
+                    FactionController::Agent(id) if id == agent.id => Some(faction.id.number()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            factions.sort_unstable();
+            AgentFactionsListEntry {
+                id: agent.id.number(),
+                identifier: agent.kind.identifier().to_owned(),
+                name: agent.kind.display_name().to_owned(),
+                factions,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.id);
+    entries
+}
+
+pub fn agent_list_json(entries: &[AgentListEntry]) -> Result<String, serde_json::Error> {
+    list_json(entries)
+}
+
+pub fn agent_factions_list_json(
+    entries: &[AgentFactionsListEntry],
+) -> Result<String, serde_json::Error> {
+    list_json(entries)
+}
+
+fn agent_list(agents: &[Agent]) -> Vec<AgentListEntry> {
+    let mut entries = agents
+        .iter()
+        .map(|agent| AgentListEntry {
+            id: agent.id.number(),
+            identifier: agent.kind.identifier().to_owned(),
+            name: agent.kind.display_name().to_owned(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.id);
+    entries
 }
 
 pub fn stellium_list(game: &Game) -> Vec<StelliumListEntry> {
@@ -110,9 +183,11 @@ mod tests {
         .unwrap();
         game.players = vec![
             crate::game::Player {
+                id: crate::game::PlayerId::new(2),
                 email: "zoe@example.com".to_owned(),
             },
             crate::game::Player {
+                id: crate::game::PlayerId::new(1),
                 email: "amy@example.com".to_owned(),
             },
         ];
@@ -127,6 +202,51 @@ mod tests {
                     email: "zoe@example.com".to_owned()
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn available_agents_come_from_the_engine_registry() {
+        assert_eq!(
+            available_agent_list(),
+            vec![AgentListEntry {
+                id: 1,
+                identifier: "uncontrolled".to_owned(),
+                name: "Uncontrolled".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn agent_factions_include_unassigned_agents_and_sorted_factions() {
+        let mut game = generate_game(
+            GameCode::new("AGENTS").unwrap(),
+            GenerateGameOptions::default(),
+        )
+        .unwrap();
+        game.factions = vec![
+            crate::game::Faction {
+                id: crate::game::FactionId::new(9),
+                controller: crate::game::FactionController::Agent(
+                    crate::game::UNCONTROLLED_AGENT_ID,
+                ),
+            },
+            crate::game::Faction {
+                id: crate::game::FactionId::new(2),
+                controller: crate::game::FactionController::Agent(
+                    crate::game::UNCONTROLLED_AGENT_ID,
+                ),
+            },
+        ];
+
+        assert_eq!(
+            agent_factions_list(&game),
+            vec![AgentFactionsListEntry {
+                id: 1,
+                identifier: "uncontrolled".to_owned(),
+                name: "Uncontrolled".to_owned(),
+                factions: vec![2, 9],
+            }]
         );
     }
 }

@@ -1,4 +1,5 @@
 pub mod accounts;
+pub mod agents;
 pub mod app;
 pub mod game;
 pub mod orders;

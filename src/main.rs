@@ -4,11 +4,12 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use ecra::app::import_order_file;
-use ecra::game::{
-    DEFAULT_MINIMUM_STELLIUM_DISTANCE, GameCode, GenerateGameOptions, Player, generate_game,
-};
+use ecra::game::{DEFAULT_MINIMUM_STELLIUM_DISTANCE, GameCode, GenerateGameOptions, generate_game};
 use ecra::orders::check_order_file_syntax;
-use ecra::reports::{player_list, player_list_json, stellium_list, stellium_list_json};
+use ecra::reports::{
+    agent_factions_list, agent_factions_list_json, agent_list_json, available_agent_list,
+    game_agent_list, player_list, player_list_json, stellium_list, stellium_list_json,
+};
 use ecra::storage::GameStore;
 
 #[derive(Debug, Parser)]
@@ -81,6 +82,32 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum ReportCommand {
+    /// List agents implemented by this engine
+    AvailableAgents {
+        /// Save the list as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
+    /// List agents assigned to a game
+    GameAgents {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Save the list as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
+    /// List a game's assigned agents and the factions they control
+    AgentFactions {
+        /// Path of the game store
+        store: PathBuf,
+        /// Short uppercase game code
+        code: String,
+        /// Save the list as JSON
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
     /// List players assigned to a game
     Players {
         /// Path of the game store
@@ -150,17 +177,66 @@ fn run() -> Result<(), Box<dyn Error>> {
         } => {
             let store = GameStore::open(store)?;
             let code = GameCode::new(code)?;
-            let players = emails
-                .into_iter()
-                .map(|email| Player { email })
-                .collect::<Vec<_>>();
-            let created = store.add_players(&code, &players)?;
+            let created = store.add_players(&code, &emails)?;
             println!(
                 "Added {created} player{} to game {code}",
                 if created == 1 { "" } else { "s" }
             );
         }
         Command::Report { report } => match report {
+            ReportCommand::AvailableAgents { json } => {
+                let entries = available_agent_list();
+                if let Some(path) = json {
+                    fs::write(&path, agent_list_json(&entries)?)?;
+                    println!("Saved available agents report to {}", path.display());
+                } else {
+                    println!("AGENT  IDENTIFIER    NAME");
+                    for entry in entries {
+                        println!("{:5}  {:12}  {}", entry.id, entry.identifier, entry.name);
+                    }
+                }
+            }
+            ReportCommand::GameAgents { store, code, json } => {
+                let store = GameStore::open(store)?;
+                let game = store.load_game(&GameCode::new(code)?)?;
+                let entries = game_agent_list(&game);
+                if let Some(path) = json {
+                    fs::write(&path, agent_list_json(&entries)?)?;
+                    println!("Saved game agents report to {}", path.display());
+                } else {
+                    println!("AGENT  IDENTIFIER    NAME");
+                    for entry in entries {
+                        println!("{:5}  {:12}  {}", entry.id, entry.identifier, entry.name);
+                    }
+                }
+            }
+            ReportCommand::AgentFactions { store, code, json } => {
+                let store = GameStore::open(store)?;
+                let game = store.load_game(&GameCode::new(code)?)?;
+                let entries = agent_factions_list(&game);
+                if let Some(path) = json {
+                    fs::write(&path, agent_factions_list_json(&entries)?)?;
+                    println!("Saved agent factions report to {}", path.display());
+                } else {
+                    println!("AGENT  IDENTIFIER    NAME          FACTIONS");
+                    for entry in entries {
+                        let factions = if entry.factions.is_empty() {
+                            "-".to_owned()
+                        } else {
+                            entry
+                                .factions
+                                .iter()
+                                .map(u64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        };
+                        println!(
+                            "{:5}  {:12}  {:12}  {factions}",
+                            entry.id, entry.identifier, entry.name
+                        );
+                    }
+                }
+            }
             ReportCommand::Players { store, code, json } => {
                 let store = GameStore::open(store)?;
                 let game = store.load_game(&GameCode::new(code)?)?;

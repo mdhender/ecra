@@ -136,7 +136,97 @@ pub struct Star {
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Player {
+    pub id: PlayerId,
     pub email: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlayerId(u64);
+
+impl PlayerId {
+    pub fn new(number: u64) -> Self {
+        Self(number)
+    }
+
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AgentId(u64);
+
+impl AgentId {
+    pub fn new(number: u64) -> Self {
+        Self(number)
+    }
+
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+pub const UNCONTROLLED_AGENT_ID: AgentId = AgentId(1);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentKind {
+    Uncontrolled,
+}
+
+impl AgentKind {
+    pub fn identifier(self) -> &'static str {
+        self.as_str()
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Uncontrolled => "Uncontrolled",
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Uncontrolled => "uncontrolled",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "uncontrolled" => Some(Self::Uncontrolled),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Agent {
+    pub id: AgentId,
+    pub kind: AgentKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FactionId(u64);
+
+impl FactionId {
+    pub fn new(number: u64) -> Self {
+        Self(number)
+    }
+
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FactionController {
+    Player(PlayerId),
+    Agent(AgentId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Faction {
+    pub id: FactionId,
+    pub controller: FactionController,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -147,6 +237,8 @@ pub struct Game {
     pub status: GameStatus,
     pub stellia: Vec<Stellium>,
     pub players: Vec<Player>,
+    pub agents: Vec<Agent>,
+    pub factions: Vec<Faction>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -203,6 +295,8 @@ pub fn generate_game(
         status: GameStatus::Setup,
         stellia,
         players: Vec::new(),
+        agents: vec![crate::agents::uncontrolled_agent()],
+        factions: Vec::new(),
     })
 }
 
@@ -275,6 +369,14 @@ mod tests {
             DEFAULT_MINIMUM_STELLIUM_DISTANCE
         );
         assert_eq!(first.status, GameStatus::Setup);
+        assert_eq!(
+            first.agents,
+            vec![Agent {
+                id: UNCONTROLLED_AGENT_ID,
+                kind: AgentKind::Uncontrolled,
+            }]
+        );
+        assert!(first.factions.is_empty());
         assert_eq!(first.stellia, second.stellia);
         assert_eq!(first.stellia.len(), STELLIA_PER_GAME);
         assert!(

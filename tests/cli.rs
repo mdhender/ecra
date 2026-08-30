@@ -22,6 +22,91 @@ fn help_lists_store_commands() {
 }
 
 #[test]
+fn reports_available_and_game_agents_as_text_and_json() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path().join("game.redb");
+    let available_json = directory.path().join("available-agents.json");
+    let game_json = directory.path().join("game-agents.json");
+    let factions_json = directory.path().join("agent-factions.json");
+
+    let available = ecra()
+        .args(["report", "available-agents"])
+        .output()
+        .unwrap();
+    assert!(available.status.success());
+    assert_eq!(
+        String::from_utf8(available.stdout).unwrap(),
+        "AGENT  IDENTIFIER    NAME\n    1  uncontrolled  Uncontrolled\n"
+    );
+    assert!(
+        ecra()
+            .args([
+                "report",
+                "available-agents",
+                "--json",
+                available_json.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    assert!(
+        ecra()
+            .args(["new", store.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ecra()
+            .args([
+                "generate-game",
+                store.to_str().unwrap(),
+                "AGENTS",
+                "--seed",
+                "42",
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let game_agents = ecra()
+        .args([
+            "report",
+            "game-agents",
+            store.to_str().unwrap(),
+            "AGENTS",
+            "--json",
+            game_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(game_agents.status.success());
+    let agent_factions = ecra()
+        .args([
+            "report",
+            "agent-factions",
+            store.to_str().unwrap(),
+            "AGENTS",
+            "--json",
+            factions_json.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(agent_factions.status.success());
+
+    let agent_json = "[\n  {\n    \"id\": 1,\n    \"identifier\": \"uncontrolled\",\n    \"name\": \"Uncontrolled\"\n  }\n]\n";
+    assert_eq!(std::fs::read_to_string(available_json).unwrap(), agent_json);
+    assert_eq!(std::fs::read_to_string(game_json).unwrap(), agent_json);
+    assert_eq!(
+        std::fs::read_to_string(factions_json).unwrap(),
+        "[\n  {\n    \"id\": 1,\n    \"identifier\": \"uncontrolled\",\n    \"name\": \"Uncontrolled\",\n    \"factions\": []\n  }\n]\n"
+    );
+}
+
+#[test]
 fn reports_stellia_to_stdout_and_deterministic_json() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("game.redb");
@@ -216,7 +301,7 @@ fn creates_then_manages_a_store() {
         String::from_utf8_lossy(&managed.stderr)
     );
     let stdout = String::from_utf8(managed.stdout).unwrap();
-    assert!(stdout.contains("Format version: 3"));
+    assert!(stdout.contains("Format version: 4"));
     assert!(stdout.contains("Current turn: 1"));
 }
 
