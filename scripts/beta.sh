@@ -6,6 +6,9 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   scripts/beta.sh create STORE [--overwrite]
+  scripts/beta.sh players available
+  scripts/beta.sh players add EMAIL...
+  scripts/beta.sh players assigned
   scripts/beta.sh report stellia [--json]
 EOF
     exit 2
@@ -37,6 +40,26 @@ load_game_config() {
         echo "error: $env_file must define ECRA_GAME_CODE" >&2
         exit 1
     fi
+}
+
+prepare_beta_game() {
+    store="$beta_dir/store"
+    require_ecra
+    load_game_config
+}
+
+list_available_players() {
+    assigned_players=$("$ecra" report players "$store" "$ECRA_GAME_CODE")
+
+    echo "EMAIL"
+    account_number=2
+    while [ "$account_number" -le 13 ]; do
+        email=$(printf 'account.%04d@example.com' "$account_number")
+        if ! printf '%s\n' "$assigned_players" | grep -Fqx -- "$email"; then
+            echo "$email"
+        fi
+        account_number=$((account_number + 1))
+    done
 }
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -94,6 +117,28 @@ case "$command" in
         then
             "$ecra" generate-game "$store" "$ECRA_GAME_CODE" --seed "$ECRA_GAME_SEED"
         fi
+        ;;
+    players)
+        [ "$#" -ge 1 ] || usage
+        player_command=$1
+        shift
+
+        prepare_beta_game
+        case "$player_command" in
+            available)
+                [ "$#" -eq 0 ] || usage
+                list_available_players
+                ;;
+            add)
+                [ "$#" -ge 1 ] || usage
+                "$ecra" add-players "$store" "$ECRA_GAME_CODE" "$@"
+                ;;
+            assigned)
+                [ "$#" -eq 0 ] || usage
+                "$ecra" report players "$store" "$ECRA_GAME_CODE"
+                ;;
+            *) usage ;;
+        esac
         ;;
     report)
         [ "$#" -ge 1 ] || usage
