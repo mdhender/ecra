@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::fmt;
 
-use crate::game::GameCode;
 pub use crate::game::{FactionId, PlayerId};
+use crate::game::{GameCode, ShipId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Turn(u32);
@@ -61,15 +61,15 @@ pub enum InventoryStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Order {
     Move {
-        entity: u64,
+        ship: ShipId,
         destination: u64,
     },
     Transfer {
-        source_entity: u64,
+        source_ship: ShipId,
         unit: String,
         status: InventoryStatus,
         quantity: u64,
-        destination_entity: u64,
+        destination_ship: ShipId,
     },
 }
 
@@ -206,7 +206,7 @@ pub fn parse_order_file_preamble(
     })
 }
 
-/// Parses every player order, returning all independent syntax errors together.
+/// Parses every ship order, returning all independent syntax errors together.
 pub fn parse_order_file(
     filename: impl Into<String>,
     source: &str,
@@ -268,7 +268,7 @@ pub fn parse_order_file(
     for tokens in segments.iter().skip(2) {
         let line = tokens.first().map_or(eof_line, |token| token.line);
         let mut parser = Parser::new(&filename, tokens, eof_line);
-        match parser.parse_player_order().and_then(|order| {
+        match parser.parse_ship_order().and_then(|order| {
             parser.expect_end()?;
             Ok(order)
         }) {
@@ -510,19 +510,16 @@ impl<'a, 'source> Parser<'a, 'source> {
         Ok(ParsedAuthentication { owner, token })
     }
 
-    fn parse_player_order(&mut self) -> Result<Order, ParseError> {
+    fn parse_ship_order(&mut self) -> Result<Order, ParseError> {
         let command = self.take_word("order name")?;
         let order = match command {
             "MOVE" => {
-                let entity = self.take_u64("entity ID")?;
+                let ship = ShipId::new(self.take_u64("ship ID")?);
                 let destination = self.take_u64("destination ID")?;
-                Order::Move {
-                    entity,
-                    destination,
-                }
+                Order::Move { ship, destination }
             }
             "TRANSFER" => {
-                let source_entity = self.take_u64("source entity ID")?;
+                let source_ship = ShipId::new(self.take_u64("source ship ID")?);
                 let unit = self.take_word("unit")?.to_owned();
                 let status_text = self.take_word("inventory status")?;
                 let status = match status_text {
@@ -537,13 +534,13 @@ impl<'a, 'source> Parser<'a, 'source> {
                     }
                 };
                 let quantity = self.take_u64("quantity")?;
-                let destination_entity = self.take_u64("destination entity ID")?;
+                let destination_ship = ShipId::new(self.take_u64("destination ship ID")?);
                 Order::Transfer {
-                    source_entity,
+                    source_ship,
                     unit,
                     status,
                     quantity,
-                    destination_entity,
+                    destination_ship,
                 }
             }
             other => {
@@ -955,18 +952,18 @@ mod tests {
                 LocatedOrder {
                     line: 3,
                     order: Order::Move {
-                        entity: 1001,
+                        ship: ShipId::new(1001),
                         destination: 12,
                     },
                 },
                 LocatedOrder {
                     line: 4,
                     order: Order::Transfer {
-                        source_entity: 1001,
+                        source_ship: ShipId::new(1001),
                         unit: "FOOD".to_owned(),
                         status: InventoryStatus::Reserved,
                         quantity: 25,
-                        destination_entity: 1002,
+                        destination_ship: ShipId::new(1002),
                     },
                 },
             ]

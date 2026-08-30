@@ -315,7 +315,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             );
             match result.parsed {
                 Ok(parsed) => {
-                    println!("Parsed {} player orders successfully", parsed.orders.len());
+                    println!("Parsed {} ship orders successfully", parsed.orders.len());
                 }
                 Err(errors) => {
                     for error in &errors {

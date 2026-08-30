@@ -9,8 +9,8 @@ use crate::accounts::{Account, AccountRole};
 use crate::agents::{available_agent, uncontrolled_agent};
 use crate::game::{
     Agent, AgentId, AgentKind, Coordinates, Faction, FactionController, FactionId, Game, GameCode,
-    GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE, Player, PlayerId, STELLIA_PER_GAME, Star,
-    StarId, Stellium, StelliumId, UNCONTROLLED_AGENT_ID,
+    GameStatus, MAXIMUM_COORDINATE, MINIMUM_COORDINATE, Player, PlayerId, STELLIA_PER_GAME, Ship,
+    ShipId, Star, StarId, Stellium, StelliumId, UNCONTROLLED_AGENT_ID,
 };
 
 const METADATA: TableDefinition<&str, &str> = TableDefinition::new("ecra_metadata");
@@ -27,6 +27,7 @@ const GAME_FACTION_CONTROLLER_KINDS: TableDefinition<&str, &str> =
     TableDefinition::new("game_faction_controller_kinds");
 const GAME_FACTION_CONTROLLER_IDS: TableDefinition<&str, u64> =
     TableDefinition::new("game_faction_controller_ids");
+const GAME_SHIP_FACTIONS: TableDefinition<&str, u64> = TableDefinition::new("game_ship_factions");
 const STELLIUM_STAR_COUNTS: TableDefinition<&str, u8> =
     TableDefinition::new("stellium_star_counts");
 const STELLIUM_X_COORDINATES: TableDefinition<&str, i8> =
@@ -46,8 +47,8 @@ const ORDER_IMPORT_DIAGNOSTICS: TableDefinition<u64, &str> =
 const APPLICATION_KEY: &str = "application";
 const APPLICATION_VALUE: &str = "ecra";
 const FORMAT_VERSION_KEY: &str = "format_version";
-const FORMAT_VERSION_VALUE: &str = "4";
-const SUPPORTED_FORMAT_VERSION: u32 = 4;
+const FORMAT_VERSION_VALUE: &str = "5";
+const SUPPORTED_FORMAT_VERSION: u32 = 5;
 const CURRENT_TURN_KEY: &str = "current_turn";
 const INITIAL_TURN: &str = "1";
 const NEXT_ORDER_IMPORT_KEY: &str = "next_order_import";
@@ -107,6 +108,10 @@ pub enum StoreError {
     GameAlreadyExists(String),
     #[error("game `{0}` does not exist")]
     GameNotFound(String),
+    #[error("faction {faction} does not exist in game `{game}`")]
+    FactionNotFound { game: String, faction: u64 },
+    #[error("ship {ship} is already owned by faction {faction}")]
+    ShipAlreadyOwned { ship: u64, faction: u64 },
     #[error("agent {0} is not implemented by this engine")]
     AgentNotAvailable(u64),
     #[error("order import {0} does not exist")]
@@ -333,6 +338,9 @@ impl GameStore {
         let faction_controller_ids = read
             .open_table(GAME_FACTION_CONTROLLER_IDS)
             .map_err(|source| database_error(&self.path, source))?;
+        let ship_factions = read
+            .open_table(GAME_SHIP_FACTIONS)
+            .map_err(|source| database_error(&self.path, source))?;
         let star_counts = read
             .open_table(STELLIUM_STAR_COUNTS)
             .map_err(|source| database_error(&self.path, source))?;
@@ -524,6 +532,30 @@ impl GameStore {
         }
         factions.sort_by_key(|faction| faction.id);
 
+        let mut ships = Vec::new();
+        for entry in ship_factions
+            .iter()
+            .map_err(|source| database_error(&self.path, source))?
+        {
+            let (key, faction_id) = entry.map_err(|source| database_error(&self.path, source))?;
+            let Some(id) = scoped_id(key.value(), code.as_str()) else {
+                continue;
+            };
+            let faction = FactionId::new(faction_id.value());
+            if !factions.iter().any(|candidate| candidate.id == faction) {
+                return Err(invalid_game(
+                    &self.path,
+                    code,
+                    "has a ship owned by a missing faction",
+                ));
+            }
+            ships.push(Ship {
+                id: ShipId::new(id),
+                faction,
+            });
+        }
+        ships.sort_by_key(|ship| ship.id);
+
         Ok(Game {
             code: code.clone(),
             seed,
@@ -533,6 +565,7 @@ impl GameStore {
             players,
             agents,
             factions,
+            ships,
         })
     }
 
@@ -655,6 +688,80 @@ impl GameStore {
                         .insert(key.as_str(), UNCONTROLLED_AGENT_ID.number())
                         .map_err(|source| database_error(&self.path, source))?;
                     created += 1;
+                }
+            }
+        }
+        write
+            .commit()
+            .map_err(|source| database_error(&self.path, source))?;
+        Ok(created)
+    }
+
+    /// Adds ships owned by an existing faction. A ship's initial owner cannot be replaced.
+    pub fn add_ships(
+        &self,
+        code: &GameCode,
+        faction_id: FactionId,
+        ship_ids: &[ShipId],
+    ) -> Result<usize, StoreError> {
+        let write = self
+            .database
+            .begin_write()
+            .map_err(|source| database_error(&self.path, source))?;
+        {
+            let games = write
+                .open_table(GAME_SEEDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            if games
+                .get(code.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::GameNotFound(code.to_string()));
+            }
+        }
+        {
+            let factions = write
+                .open_table(GAME_FACTION_CONTROLLER_KINDS)
+                .map_err(|source| database_error(&self.path, source))?;
+            let key = faction_key(code.as_str(), faction_id);
+            if factions
+                .get(key.as_str())
+                .map_err(|source| database_error(&self.path, source))?
+                .is_none()
+            {
+                return Err(StoreError::FactionNotFound {
+                    game: code.to_string(),
+                    faction: faction_id.number(),
+                });
+            }
+        }
+
+        let mut created = 0;
+        {
+            let mut ships = write
+                .open_table(GAME_SHIP_FACTIONS)
+                .map_err(|source| database_error(&self.path, source))?;
+            for ship_id in ship_ids {
+                let key = ship_key(code.as_str(), *ship_id);
+                let existing = ships
+                    .get(key.as_str())
+                    .map_err(|source| database_error(&self.path, source))?
+                    .map(|value| value.value());
+                match existing {
+                    Some(existing) if existing == faction_id.number() => {}
+                    Some(existing) => {
+                        return Err(StoreError::ShipAlreadyOwned {
+                            ship: ship_id.number(),
+                            faction: existing,
+                        });
+                    }
+                    None => {
+                        ships
+                            .insert(key.as_str(), faction_id.number())
+                            .map_err(|source| database_error(&self.path, source))?;
+                        created += 1;
+                    }
                 }
             }
         }
@@ -996,6 +1103,9 @@ fn database_tables(write: &redb::WriteTransaction, path: &Path) -> Result<(), St
         .open_table(GAME_FACTION_CONTROLLER_IDS)
         .map_err(|source| database_error(path, source))?;
     write
+        .open_table(GAME_SHIP_FACTIONS)
+        .map_err(|source| database_error(path, source))?;
+    write
         .open_table(STELLIUM_STAR_COUNTS)
         .map_err(|source| database_error(path, source))?;
     write
@@ -1095,6 +1205,10 @@ fn faction_key(code: &str, id: FactionId) -> String {
     format!("{code}:{}", id.number())
 }
 
+fn ship_key(code: &str, id: ShipId) -> String {
+    format!("{code}:{}", id.number())
+}
+
 fn scoped_id(key: &str, code: &str) -> Option<u64> {
     key.strip_prefix(code)?.strip_prefix(':')?.parse().ok()
 }
@@ -1120,7 +1234,7 @@ mod tests {
         assert_eq!(
             store.info().unwrap(),
             StoreInfo {
-                format_version: 4,
+                format_version: 5,
                 current_turn: 1
             }
         );
@@ -1130,7 +1244,7 @@ mod tests {
         assert_eq!(
             reopened.info().unwrap(),
             StoreInfo {
-                format_version: 4,
+                format_version: 5,
                 current_turn: 1
             }
         );
@@ -1366,5 +1480,80 @@ mod tests {
             store.add_factions(&code, &[FactionId::new(1)]),
             Err(StoreError::GameNotFound(found)) if found == "MISSING"
         ));
+    }
+
+    #[test]
+    fn adds_faction_ships_idempotently_and_reopens_them_in_id_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("game.redb");
+        let store = GameStore::create(&path).unwrap();
+        let game = crate::game::generate_game(
+            GameCode::new("SHIPS").unwrap(),
+            crate::game::GenerateGameOptions::default(),
+        )
+        .unwrap();
+        store.create_game(&game).unwrap();
+        let faction = FactionId::new(7);
+        store.add_factions(&game.code, &[faction]).unwrap();
+        let ships = [ShipId::new(1002), ShipId::new(1001), ShipId::new(1002)];
+
+        assert_eq!(store.add_ships(&game.code, faction, &ships).unwrap(), 2);
+        assert_eq!(store.add_ships(&game.code, faction, &ships).unwrap(), 0);
+        drop(store);
+
+        let loaded = GameStore::open(path)
+            .unwrap()
+            .load_game(&game.code)
+            .unwrap();
+        assert_eq!(
+            loaded.ships,
+            vec![
+                Ship {
+                    id: ShipId::new(1001),
+                    faction,
+                },
+                Ship {
+                    id: ShipId::new(1002),
+                    faction,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn refuses_missing_factions_and_does_not_reassign_ships() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = GameStore::create(directory.path().join("game.redb")).unwrap();
+        let game = crate::game::generate_game(
+            GameCode::new("SHIPS").unwrap(),
+            crate::game::GenerateGameOptions::default(),
+        )
+        .unwrap();
+        store.create_game(&game).unwrap();
+        let first = FactionId::new(7);
+        let second = FactionId::new(8);
+        store.add_factions(&game.code, &[first, second]).unwrap();
+        store
+            .add_ships(&game.code, first, &[ShipId::new(1001)])
+            .unwrap();
+
+        assert!(matches!(
+            store.add_ships(&game.code, FactionId::new(99), &[ShipId::new(2001)]),
+            Err(StoreError::FactionNotFound { faction: 99, .. })
+        ));
+        assert!(matches!(
+            store.add_ships(&game.code, second, &[ShipId::new(2001), ShipId::new(1001)]),
+            Err(StoreError::ShipAlreadyOwned {
+                ship: 1001,
+                faction: 7
+            })
+        ));
+        assert_eq!(
+            store.load_game(&game.code).unwrap().ships,
+            vec![Ship {
+                id: ShipId::new(1001),
+                faction: first,
+            }]
+        );
     }
 }

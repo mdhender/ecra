@@ -116,9 +116,9 @@ EMAIL
 admiral.sato@example.com
 No syntax errors found in tests/fixtures/orders/valid-complete.orders
 Imported tests/fixtures/orders/valid-complete.orders as order import 1
-Parsed 2 player orders successfully
+Parsed 2 ship orders successfully
 Store: /tmp/demo.redb
-Format version: 4
+Format version: 5
 Current turn: 1
 Games: 1
 ```
@@ -135,7 +135,7 @@ cargo run -- check-orders tests/fixtures/orders/multiple-syntax-errors.orders
 ```
 tests/fixtures/orders/multiple-syntax-errors.orders:1: turn number must be an unsigned 32-bit integer (found `tomorrow`)
 tests/fixtures/orders/multiple-syntax-errors.orders:2: player ID must be an unsigned 64-bit integer (found `nobody`)
-tests/fixtures/orders/multiple-syntax-errors.orders:3: entity ID must be an unsigned 64-bit integer (found `unknown`)
+tests/fixtures/orders/multiple-syntax-errors.orders:3: ship ID must be an unsigned 64-bit integer (found `unknown`)
 error: found 3 syntax errors
 ```
 
@@ -162,16 +162,22 @@ not newlines or control characters. **The token is not verified during parsing o
 import** — authentication is a later, state-dependent concern, kept out of the parser
 by design.
 
-Player orders follow:
+Ship orders follow:
 
 ```
-MOVE <entity> <destination>;
-TRANSFER <source-entity> <unit> <status> <quantity> <destination-entity>;
+MOVE <ship> <destination>;
+TRANSFER <source-ship> <unit> <status> <quantity> <destination-ship>;
 ```
 
 `<status>` is `AVAILABLE`, `RESERVED`, or `DAMAGED`. Keywords are case-sensitive:
 structural words (`game`, `turn`, `authenticate`, `with`, `token`, `email`, `player`,
 `faction`) are lowercase; order verbs and inventory statuses are uppercase.
+
+Factions own ships. During state-dependent validation, the `authenticate faction <id>`
+entry selects the faction issuing the file: it may move its ships and transfer inventory
+from its ships, including to a recipient ship owned by another faction. A missing ship,
+a ship owned by another faction, or email/player authentication cannot authorize a ship
+order. Token verification remains a separate, later concern.
 
 A complete example, from `tests/fixtures/orders/valid-complete.orders`:
 
@@ -196,9 +202,10 @@ implementation plan.
 | `src/orders.rs` | Tokenizing and parsing order-file text into domain `Order` values |
 | `src/accounts.rs` | Account identity and roles |
 | `src/agents.rs` | Engine-owned registry of implemented agents |
-| `src/game.rs` | Game identity and deterministic star-cluster generation |
+| `src/game.rs` | Game identity, factions and ships, and deterministic star-cluster generation |
 | `src/storage.rs` | `GameStore`, the domain-oriented `redb` API |
 | `src/app.rs` | Lifecycle orchestration across parsing and storage |
+| `src/validation.rs` | State-dependent faction ownership checks producing `ValidatedOrder` values |
 | `src/main.rs` | CLI argument parsing and command dispatch |
 | `tests/cli.rs` | End-to-end tests over the built binary |
 

@@ -301,7 +301,7 @@ fn creates_then_manages_a_store() {
         String::from_utf8_lossy(&managed.stderr)
     );
     let stdout = String::from_utf8(managed.stdout).unwrap();
-    assert!(stdout.contains("Format version: 4"));
+    assert!(stdout.contains("Format version: 5"));
     assert!(stdout.contains("Current turn: 1"));
 }
 
@@ -594,7 +594,7 @@ fn import_orders_persists_and_parses_the_file() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("order import 1"));
-    assert!(stdout.contains("Parsed 1 player orders successfully"));
+    assert!(stdout.contains("Parsed 1 ship orders successfully"));
 }
 
 #[test]

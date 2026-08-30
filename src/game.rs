@@ -229,6 +229,25 @@ pub struct Faction {
     pub controller: FactionController,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ShipId(u64);
+
+impl ShipId {
+    pub fn new(number: u64) -> Self {
+        Self(number)
+    }
+
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ship {
+    pub id: ShipId,
+    pub faction: FactionId,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Game {
     pub code: GameCode,
@@ -239,6 +258,7 @@ pub struct Game {
     pub players: Vec<Player>,
     pub agents: Vec<Agent>,
     pub factions: Vec<Faction>,
+    pub ships: Vec<Ship>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -297,6 +317,7 @@ pub fn generate_game(
         players: Vec::new(),
         agents: vec![crate::agents::uncontrolled_agent()],
         factions: Vec::new(),
+        ships: Vec::new(),
     })
 }
 
